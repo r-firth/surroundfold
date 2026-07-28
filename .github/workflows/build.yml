@@ -1,0 +1,84 @@
+name: build-and-test
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.88.0 --component clippy,rustfmt
+          rustup default 1.88.0
+
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint default build
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Lint without embedded TrueHD
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          --no-default-features -- -D warnings
+
+      - name: Test default build
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Test without embedded TrueHD
+        run: >-
+          cargo test --workspace --all-targets --locked
+          --no-default-features
+
+      - name: Build release executable
+        run: |
+          flag_separator=$'\x1f'
+          remap_flags="--remap-path-prefix=$HOME=/build${flag_separator}--remap-path-prefix=$GITHUB_WORKSPACE=/source"
+          CARGO_ENCODED_RUSTFLAGS="$remap_flags" \
+            cargo build --workspace --release --locked
+
+      - name: Smoke release executable
+        run: scripts/smoke-published.sh target/release/surroundfold
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: surroundfold-macos-${{ matrix.arch }}
+          path: target/release/surroundfold
+          if-no-files-found: error
+
+  supply-chain:
+    name: Dependency policy
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.4 --locked
+
+      - name: Check advisories, licenses, and sources
+        run: cargo deny --all-features check advisories licenses sources
