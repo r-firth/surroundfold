@@ -11,6 +11,7 @@ pub struct ResolvedPaths {
     pub input: PathBuf,
     pub hrir: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    pub in_place: bool,
     pub room_correction: Option<PathBuf>,
 }
 
@@ -30,6 +31,7 @@ impl ResolvedPaths {
                 input,
                 hrir: None,
                 output: None,
+                in_place: false,
                 room_correction: None,
             });
         }
@@ -45,10 +47,7 @@ impl ResolvedPaths {
             .map(|path| existing_file(path, "room-correction"))
             .transpose()?;
 
-        let requested_output = cli
-            .output
-            .clone()
-            .unwrap_or_else(|| default_output_path(&input));
+        let requested_output = cli.output.clone().unwrap_or_else(|| input.clone());
         let output = resolve_output(&requested_output)?;
 
         if !output
@@ -60,12 +59,8 @@ impl ResolvedPaths {
                 "the output path must have an .mkv extension".into(),
             ));
         }
-        if paths_equal(&input, &output)? {
-            return Err(AppError::Usage(
-                "the output path resolves to the input path; the input is never overwritten".into(),
-            ));
-        }
-        if output.exists() && !cli.overwrite {
+        let in_place = paths_equal(&input, &output)?;
+        if output.exists() && !in_place && !cli.overwrite {
             return Err(AppError::Usage(format!(
                 "the output already exists: {}; use --overwrite to replace it",
                 output.display()
@@ -76,6 +71,7 @@ impl ResolvedPaths {
             input,
             hrir,
             output: Some(output),
+            in_place,
             room_correction,
         })
     }
@@ -156,25 +152,46 @@ fn paths_equal(first: &Path, second: &Path) -> Result<bool, AppError> {
     }
 }
 
-#[must_use]
-pub fn default_output_path(input: &Path) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_else(|| OsStr::new("output"));
-    let mut name = stem.to_os_string();
-    name.push(".surroundfold.mkv");
-    input.parent().unwrap_or_else(|| Path::new(".")).join(name)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
 
-    use super::default_output_path;
+    use clap::Parser;
+
+    use super::ResolvedPaths;
+    use crate::cli::Cli;
 
     #[test]
-    fn default_output_is_beside_input() {
-        assert_eq!(
-            default_output_path(Path::new("/media/Movie.mov")),
-            Path::new("/media/Movie.surroundfold.mkv")
-        );
+    fn default_output_is_the_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("Movie.mkv");
+        fs::write(&input, b"fixture").unwrap();
+        let cli = Cli::try_parse_from(["surroundfold", input.to_str().unwrap()]).unwrap();
+        let paths = ResolvedPaths::from_cli(&cli).unwrap();
+
+        assert_eq!(paths.output.as_deref(), Some(paths.input.as_path()));
+        assert!(paths.in_place);
+    }
+
+    #[test]
+    fn explicit_output_is_not_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("Movie.mkv");
+        let output = directory.path().join("Other.mkv");
+        fs::write(&input, b"fixture").unwrap();
+        let cli = Cli::try_parse_from([
+            "surroundfold",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        let paths = ResolvedPaths::from_cli(&cli).unwrap();
+        let expected = fs::canonicalize(directory.path())
+            .unwrap()
+            .join("Other.mkv");
+
+        assert_eq!(paths.output.as_deref(), Some(expected.as_path()));
+        assert!(!paths.in_place);
     }
 }

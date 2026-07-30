@@ -23,6 +23,10 @@ pub struct StreamManifest {
     #[serde(default, deserialize_with = "optional_number")]
     pub sample_rate: Option<u32>,
     #[serde(default, deserialize_with = "optional_number")]
+    pub bits_per_raw_sample: Option<u16>,
+    #[serde(default, deserialize_with = "optional_number")]
+    pub initial_padding: Option<u32>,
+    #[serde(default, deserialize_with = "optional_number")]
     pub start_time: Option<f64>,
     #[serde(default, deserialize_with = "optional_number")]
     pub duration: Option<f64>,
@@ -164,6 +168,7 @@ mod tests {
                 "codec_name": "truehd",
                 "channels": 8,
                 "sample_rate": "48000",
+                "bits_per_raw_sample": "24",
                 "start_time": "1.250000",
                 "duration": "N/A",
                 "tags": {"language": "eng"},
@@ -174,6 +179,7 @@ mod tests {
         }"#;
         let manifest: ContainerManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.streams[0].sample_rate, Some(48_000));
+        assert_eq!(manifest.streams[0].bits_per_raw_sample, Some(24));
         assert_eq!(manifest.streams[0].start_time, Some(1.25));
         assert_eq!(manifest.streams[0].duration, None);
         assert_eq!(manifest.format.duration, Some(12.5));

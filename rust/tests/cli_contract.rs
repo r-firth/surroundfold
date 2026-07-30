@@ -60,6 +60,25 @@ fn cli_handles_leading_hyphen_unicode_spaces_and_apostrophes() {
         json["output"].as_str(),
         fs::canonicalize(&output).unwrap().to_str()
     );
+    let timings = &json["timingsSeconds"];
+    for phase in [
+        "preparation",
+        "render",
+        "encodeAndMux",
+        "verificationAndPublication",
+        "total",
+    ] {
+        assert!(
+            timings[phase]
+                .as_f64()
+                .is_some_and(|seconds| seconds >= 0.0),
+            "missing or invalid {phase} timing: {timings}"
+        );
+    }
+    assert!(
+        timings["total"].as_f64().unwrap()
+            >= timings["render"].as_f64().unwrap() + timings["encodeAndMux"].as_f64().unwrap()
+    );
 }
 
 #[test]

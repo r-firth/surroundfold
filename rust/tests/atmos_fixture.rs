@@ -60,7 +60,8 @@ fn external_atmos_fixture_renders_objects() {
     let manifest = MediaProbe::new(&runner, ffprobe).probe(&output).unwrap();
     assert_eq!(manifest.streams.len(), 2);
     assert_eq!(manifest.streams[0].codec_name, "truehd");
-    assert_eq!(manifest.streams[1].codec_name, "pcm_s16le");
+    assert_eq!(manifest.streams[1].codec_name, "flac");
+    assert_eq!(manifest.streams[1].bits_per_raw_sample, Some(24));
 }
 
 fn wrap_truehd(runner: &ProcessRunner, ffmpeg: &Path, sample: &Path, output: &Path) {

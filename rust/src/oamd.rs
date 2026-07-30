@@ -5,7 +5,10 @@ use crate::{
     error::AppError,
     hrir::Speaker,
     isf::IsfConfig,
-    object::{IsfState, ObjectState, SpatialUpdate},
+    object::{
+        IsfState, ObjectState, ObjectTrim, ObjectTrimMode, ObjectTrimSettings, ObjectZone,
+        SpatialUpdate, interpolate_screen_geometry, project_room_distance,
+    },
 };
 
 const OAMD_PAYLOAD_ID: u32 = 11;
@@ -18,6 +21,31 @@ const DISTANCE_FACTORS: [f32; 16] = [
     1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
 ];
 const DEPTH_FACTORS: [f32; 4] = [0.25, 0.5, 1.0, 2.0];
+const DIVERGENCE_TABLE: [f32; 4] = [0.500_755, 0.608_529, 0.704_833, 1.0];
+#[rustfmt::skip]
+const DIVERGENCE_CODES: [Option<f32>; 64] = [
+    None, Some(0.0), Some(0.004_026), Some(0.007_16),
+    Some(0.012_731), Some(0.020_173), Some(0.028_485), Some(0.040_21),
+    Some(0.050_582), Some(0.063_601), Some(0.079_914), Some(0.100_299),
+    Some(0.125_666), Some(0.140_532), Some(0.157_027), Some(0.175_282),
+    Some(0.195_417), Some(0.217_536), Some(0.241_718), Some(0.268_002),
+    Some(0.296_377), Some(0.326_766), Some(0.359_017), Some(0.392_895),
+    Some(0.428_081), Some(0.464_184), Some(0.500_755), Some(0.537_316),
+    Some(0.573_389), Some(0.608_529), Some(0.642_346), Some(0.674_524),
+    Some(0.704_833), Some(0.733_123), Some(0.759_32), Some(0.783_416),
+    Some(0.805_451), Some(0.825_506), Some(0.843_686), Some(0.860_112),
+    Some(0.874_914), Some(0.888_222), Some(0.900_168), Some(0.910_875),
+    Some(0.920_461), Some(0.929_035), Some(0.936_698), Some(0.943_544),
+    Some(0.949_656), Some(0.955_112), Some(0.959_98), Some(0.964_322),
+    Some(0.968_195), Some(0.974_729), Some(0.979_923), Some(0.984_05),
+    Some(0.987_33), Some(0.989_935), Some(0.992_874), Some(0.994_955),
+    Some(0.996_817), Some(0.998_21), Some(0.998_993), Some(1.0),
+];
+const EXTENDED_POSITION_CODES: [f32; 4] = [1.0, 2.0, -1.0, -2.0];
+const TRIM_LEVELS_DB: [f32; 16] = [
+    6.0, 3.0, 1.5, 0.75, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -16.0,
+    -36.0,
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OamdFrame {
@@ -97,7 +125,7 @@ impl OamdDecoder {
             .collect::<Vec<_>>();
         if lfe_object_indices.len() > 1 {
             return Err(unsupported(
-                "OAMD programs with two independent LFE objects",
+                "OAMD programs with two LFE labels but only one bypass LFE essence",
             ));
         }
         let joc_object_count = object_count - lfe_object_indices.len();
@@ -118,6 +146,9 @@ impl OamdDecoder {
         }
         let mut updates = Vec::new();
         let mut decoded_object_element = false;
+        let mut object_blocks = None;
+        let mut decoded_extended_element = false;
+        let mut trim = None;
         for _ in 0..element_count {
             let element_id = bits.read_u8(4)?;
             let element_bytes = usize::try_from(bits.variable(4, Some(3))?)
@@ -151,7 +182,7 @@ impl OamdDecoder {
                 if decoded_object_element {
                     return Err(unsupported("multiple OAMD object elements in one payload"));
                 }
-                updates = self.read_object_element(
+                let decoded = self.read_object_element(
                     &mut bits,
                     payload.sample_offset.map_or(0, usize::from),
                     &assignment.bed_speakers,
@@ -159,10 +190,31 @@ impl OamdDecoder {
                     assignment.isf_object_count,
                     object_count,
                 )?;
+                updates = decoded.updates;
+                object_blocks = Some(decoded.blocks);
                 decoded_object_element = true;
+            } else if element_id == 2 {
+                if trim.is_some() {
+                    return Err(unsupported("multiple OAMD trim elements in one payload"));
+                }
+                trim = Some(read_trim_element(&mut bits, object_count)?);
+            } else if element_id == 5 {
+                if decoded_extended_element {
+                    return Err(unsupported(
+                        "multiple OAMD extended-object elements in one payload",
+                    ));
+                }
+                let blocks = object_blocks.as_ref().ok_or_else(|| {
+                    unsupported("OAMD extended-object element precedes its object element")
+                })?;
+                self.apply_extended_object_element(&mut bits, blocks, &mut updates)?;
+                decoded_extended_element = true;
             }
             bits.set_position(element_end)?;
             bits.set_limit(outer_limit)?;
+        }
+        if let (Some(trim), Some(blocks)) = (&trim, &object_blocks) {
+            apply_trim_element(trim, blocks, &mut updates)?;
         }
 
         Ok(OamdFrame {
@@ -185,7 +237,7 @@ impl OamdDecoder {
         lfe_object_indices: &[usize],
         isf_object_count: usize,
         object_count: usize,
-    ) -> Result<Vec<SpatialUpdate>, AppError> {
+    ) -> Result<DecodedObjectElement, AppError> {
         let sample_offset = match bits.read_u8(2)? {
             0 => 0,
             1 => SAMPLE_OFFSET_TABLE[bits.read_usize(2)?],
@@ -212,17 +264,16 @@ impl OamdDecoder {
             });
         }
 
-        let default_screen_ratio = bits.read_bit()?;
-        let _reference_screen_ratio = if default_screen_ratio {
-            1.0
-        } else {
-            (f32::from(bits.read_u8(5)?) + 1.0) / 33.0
-        };
+        let reserved_data_not_present = bits.read_bit()?;
+        if !reserved_data_not_present {
+            bits.skip(5)?;
+        }
 
         let mut states = vec![Vec::with_capacity(object_count); block_count];
         let mut isf_states = vec![Vec::with_capacity(isf_object_count); block_count];
+        let mut blocks = vec![vec![ObjectBlockContext::default(); block_count]; object_count];
         let mut previous_gain_in_block = vec![1.0_f32; block_count];
-        for object_index in 0..object_count {
+        for (object_index, object_blocks) in blocks.iter_mut().enumerate() {
             let in_bed = object_index < bed_speakers.len();
             let in_isf = object_index >= bed_speakers.len()
                 && object_index < bed_speakers.len() + isf_object_count;
@@ -272,35 +323,77 @@ impl OamdDecoder {
                 }
 
                 let properties = &self.properties[object_index];
-                let position = if let Some(speaker) = bed_speakers.get(object_index) {
-                    speaker.position()
+                let source_channel = if lfe_object_indices.contains(&object_index) {
+                    Some(object_count - lfe_object_indices.len())
                 } else {
-                    room_position(properties.position)
+                    Some(
+                        object_index
+                            - lfe_object_indices
+                                .partition_point(|lfe_index| *lfe_index < object_index),
+                    )
                 };
-                if !lfe_object_indices.contains(&object_index) {
-                    let source_channel = object_index
-                        - lfe_object_indices.partition_point(|lfe_index| *lfe_index < object_index);
+                object_blocks[block_index] = ObjectBlockContext {
+                    active: !inactive,
+                    dynamic: !(in_bed || in_isf),
+                    source_channel,
+                    room_position: properties.position,
+                    screen_anchored: properties.screen_anchored,
+                    screen_factor: properties.screen_factor,
+                    depth_factor: properties.depth_factor,
+                    distance_factor: properties.distance_factor,
+                };
+                let (position, size) = if let Some(speaker) = bed_speakers.get(object_index) {
+                    (speaker.position(), properties.size)
+                } else {
+                    let room_position = room_position(properties.position);
+                    let (room_position, size) = if properties.screen_anchored {
+                        interpolate_screen_geometry(
+                            room_position,
+                            properties.size,
+                            properties.screen_factor,
+                            properties.depth_factor,
+                        )
+                    } else {
+                        (room_position, properties.size)
+                    };
+                    (
+                        project_room_distance(room_position, properties.distance_factor),
+                        size,
+                    )
+                };
+                if let Some(source_channel) = source_channel {
                     if in_isf {
                         isf_states[block_index].push(IsfState {
                             source_channel,
                             active: !inactive,
                             gain: properties.gain,
+                            trim: ObjectTrim::default_algorithm(),
                         });
                     } else {
                         states[block_index].push(ObjectState {
                             source_channel,
                             active: !inactive,
-                            bed: in_bed,
+                            bed_speaker: if in_bed {
+                                bed_speakers.get(object_index).copied()
+                            } else {
+                                None
+                            },
                             position,
+                            distance_factor: properties.distance_factor,
                             gain: properties.gain,
-                            size: properties.diffusion(),
+                            size,
+                            snap: properties.snap && !properties.screen_anchored,
+                            zone: properties.zone,
+                            elevation: properties.elevation,
+                            divergence: properties.divergence,
+                            trim: ObjectTrim::default_algorithm(),
                         });
                     }
                 }
             }
         }
 
-        Ok(timing
+        let updates = timing
             .into_iter()
             .zip(states)
             .zip(isf_states)
@@ -311,7 +404,92 @@ impl OamdDecoder {
                 isf,
                 objects,
             })
-            .collect())
+            .collect();
+        Ok(DecodedObjectElement { updates, blocks })
+    }
+
+    fn apply_extended_object_element(
+        &mut self,
+        bits: &mut BitReader<'_>,
+        blocks: &[Vec<ObjectBlockContext>],
+        updates: &mut [SpatialUpdate],
+    ) -> Result<(), AppError> {
+        if bits.read_bit()? {
+            for (object_index, object_blocks) in blocks.iter().enumerate() {
+                let mut previous = self.properties[object_index].divergence;
+                for (block_index, context) in object_blocks.iter().enumerate() {
+                    let divergence = if !context.active || !context.dynamic {
+                        0.0
+                    } else {
+                        read_divergence(bits, previous)?
+                    };
+                    previous = divergence;
+                    if let Some(source_channel) = context.source_channel
+                        && let Some(state) = updates.get_mut(block_index).and_then(|update| {
+                            update
+                                .objects
+                                .iter_mut()
+                                .find(|state| state.source_channel == source_channel)
+                        })
+                    {
+                        state.divergence = divergence;
+                    }
+                }
+                self.properties[object_index].divergence = previous;
+            }
+        } else {
+            for properties in &mut self.properties {
+                properties.divergence = 0.0;
+            }
+        }
+
+        if bits.read_bit()? {
+            for object_blocks in blocks {
+                for (block_index, context) in object_blocks.iter().enumerate() {
+                    if !context.active || !context.dynamic || !bits.read_bit()? {
+                        continue;
+                    }
+                    let presence = bits.read_u8(3)?;
+                    let mut position = context.room_position;
+                    if presence & 1 != 0 {
+                        position[0] += EXTENDED_POSITION_CODES[bits.read_usize(2)?] / 310.0;
+                    }
+                    if presence & 2 != 0 {
+                        position[1] += EXTENDED_POSITION_CODES[bits.read_usize(2)?] / 310.0;
+                    }
+                    if presence & 4 != 0 {
+                        position[2] += EXTENDED_POSITION_CODES[bits.read_usize(2)?] / 75.0;
+                    }
+                    position[0] = position[0].clamp(0.0, 1.0);
+                    position[1] = position[1].clamp(0.0, 1.0);
+                    position[2] = position[2].clamp(-1.0, 1.0);
+                    if let Some(source_channel) = context.source_channel
+                        && let Some(state) = updates.get_mut(block_index).and_then(|update| {
+                            update
+                                .objects
+                                .iter_mut()
+                                .find(|state| state.source_channel == source_channel)
+                        })
+                    {
+                        let room_position = room_position(position);
+                        let room_position = if context.screen_anchored {
+                            interpolate_screen_geometry(
+                                room_position,
+                                [0.0; 3],
+                                context.screen_factor,
+                                context.depth_factor,
+                            )
+                            .0
+                        } else {
+                            room_position
+                        };
+                        state.position =
+                            project_room_distance(room_position, context.distance_factor);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -401,6 +579,179 @@ struct BlockTiming {
     ramp_samples: usize,
 }
 
+struct DecodedObjectElement {
+    updates: Vec<SpatialUpdate>,
+    blocks: Vec<Vec<ObjectBlockContext>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObjectBlockContext {
+    active: bool,
+    dynamic: bool,
+    source_channel: Option<usize>,
+    room_position: [f32; 3],
+    screen_anchored: bool,
+    screen_factor: f32,
+    depth_factor: f32,
+    distance_factor: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct DecodedTrim {
+    trim: ObjectTrim,
+    disabled_objects: Vec<bool>,
+}
+
+impl DecodedTrim {
+    fn for_object(&self, object_index: usize) -> ObjectTrim {
+        let mut trim = self.trim;
+        trim.disabled = self
+            .disabled_objects
+            .get(object_index)
+            .copied()
+            .unwrap_or(false);
+        trim
+    }
+}
+
+fn read_trim_element(
+    bits: &mut BitReader<'_>,
+    object_count: usize,
+) -> Result<DecodedTrim, AppError> {
+    let warp_y = match bits.read_u8(2)? {
+        0 => false,
+        1 => true,
+        reserved => return Err(unsupported(format!("reserved OAMD warp mode {reserved}"))),
+    };
+    let _reserved = bits.read_u8(2)?;
+    let global_mode = bits.read_u8(2)?;
+    if global_mode == 3 {
+        return Err(unsupported("reserved OAMD global trim mode 3"));
+    }
+    let trim = match global_mode {
+        0 => ObjectTrim::uniform(
+            warp_y,
+            ObjectTrimSettings {
+                mode: ObjectTrimMode::Default,
+                ..ObjectTrimSettings::default()
+            },
+        ),
+        1 => ObjectTrim::uniform(warp_y, ObjectTrimSettings::default()),
+        2 => {
+            let mut configurations = [ObjectTrimSettings::default(); 9];
+            for configuration in &mut configurations {
+                let default_trim = bits.read_bit()?;
+                let configuration_trim = if default_trim {
+                    ObjectTrimSettings {
+                        mode: ObjectTrimMode::Default,
+                        ..ObjectTrimSettings::default()
+                    }
+                } else if bits.read_bit()? {
+                    ObjectTrimSettings::default()
+                } else {
+                    let presence = bits.read_u8(5)?;
+                    let center_db = if presence & 1 != 0 {
+                        TRIM_LEVELS_DB[bits.read_usize(4)?]
+                    } else {
+                        0.0
+                    };
+                    let surround_db = if presence & 2 != 0 {
+                        read_reduction_trim(bits, "surround")?
+                    } else {
+                        0.0
+                    };
+                    let height_db = if presence & 4 != 0 {
+                        read_reduction_trim(bits, "height")?
+                    } else {
+                        0.0
+                    };
+                    let top_bottom_balance = if presence & 8 != 0 {
+                        read_balance(bits)?
+                    } else {
+                        0.0
+                    };
+                    let listener_balance = if presence & 16 != 0 {
+                        read_balance(bits)?
+                    } else {
+                        0.0
+                    };
+                    ObjectTrimSettings {
+                        mode: ObjectTrimMode::Custom,
+                        center_db,
+                        surround_db,
+                        height_db,
+                        top_bottom_balance,
+                        listener_balance,
+                    }
+                };
+                *configuration = configuration_trim;
+            }
+            ObjectTrim::from_configurations(warp_y, configurations)
+        }
+        _ => unreachable!("reserved global mode was rejected above"),
+    };
+    let disabled_objects = if bits.read_bit()? {
+        (0..object_count)
+            .map(|_| bits.read_bit())
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(DecodedTrim {
+        trim,
+        disabled_objects,
+    })
+}
+
+fn read_reduction_trim(bits: &mut BitReader<'_>, name: &str) -> Result<f32, AppError> {
+    let code = bits.read_usize(4)?;
+    if code < 4 {
+        return Err(unsupported(format!(
+            "reserved OAMD {name} trim code {code}"
+        )));
+    }
+    Ok(TRIM_LEVELS_DB[code])
+}
+
+fn read_balance(bits: &mut BitReader<'_>) -> Result<f32, AppError> {
+    let sign = if bits.read_bit()? { 1.0 } else { -1.0 };
+    Ok(sign * (f32::from(bits.read_u8(4)?) + 1.0) / 16.0)
+}
+
+fn apply_trim_element(
+    trim: &DecodedTrim,
+    blocks: &[Vec<ObjectBlockContext>],
+    updates: &mut [SpatialUpdate],
+) -> Result<(), AppError> {
+    for (object_index, object_blocks) in blocks.iter().enumerate() {
+        let object_trim = trim.for_object(object_index);
+        for (block_index, context) in object_blocks.iter().enumerate() {
+            let Some(source_channel) = context.source_channel else {
+                continue;
+            };
+            let update = updates.get_mut(block_index).ok_or_else(|| {
+                invalid(format!(
+                    "trim metadata references missing object block {block_index}"
+                ))
+            })?;
+            if let Some(state) = update
+                .objects
+                .iter_mut()
+                .find(|state| state.source_channel == source_channel)
+            {
+                state.trim = object_trim;
+            } else if let Some(state) = update
+                .isf
+                .iter_mut()
+                .find(|state| state.source_channel == source_channel)
+            {
+                state.trim = object_trim;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct ObjectProperties {
     position: [f32; 3],
@@ -410,6 +761,10 @@ struct ObjectProperties {
     screen_factor: f32,
     depth_factor: f32,
     distance_factor: Option<f32>,
+    snap: bool,
+    zone: ObjectZone,
+    elevation: bool,
+    divergence: f32,
 }
 
 impl Default for ObjectProperties {
@@ -422,6 +777,10 @@ impl Default for ObjectProperties {
             screen_factor: 0.0,
             depth_factor: 1.0,
             distance_factor: None,
+            snap: false,
+            zone: ObjectZone::All,
+            elevation: true,
+            divergence: 0.0,
         }
     }
 }
@@ -438,12 +797,9 @@ impl ObjectProperties {
         self.screen_factor = 0.0;
         self.depth_factor = 1.0;
         self.distance_factor = None;
-    }
-
-    fn diffusion(&self) -> f32 {
-        (self.size.iter().map(|value| value * value).sum::<f32>() / 3.0)
-            .sqrt()
-            .clamp(0.0, 1.0)
+        self.snap = false;
+        self.zone = ObjectZone::All;
+        self.elevation = true;
     }
 }
 
@@ -531,12 +887,14 @@ fn read_render_info(
         };
     }
     if mask & 2 != 0 {
-        let _zone = bits.read_u8(3)?;
-        let _elevation_enabled = bits.read_bit()?;
+        let zone_index = bits.read_u8(3)?;
+        properties.zone = ObjectZone::try_from(zone_index)
+            .map_err(|reserved| unsupported(format!("reserved OAMD zone index {reserved}")))?;
+        properties.elevation = bits.read_bit()?;
     }
     if mask & 4 != 0 {
         properties.size = match bits.read_u8(2)? {
-            0 | 3 => [0.0; 3],
+            0 => [0.0; 3],
             1 => {
                 let size = f32::from(bits.read_u8(5)?) / 31.0;
                 [size; 3]
@@ -546,6 +904,7 @@ fn read_render_info(
                 f32::from(bits.read_u8(5)?) / 31.0,
                 f32::from(bits.read_u8(5)?) / 31.0,
             ],
+            3 => return Err(unsupported("reserved OAMD object size index 3")),
             _ => unreachable!("two-bit size index is exhaustive"),
         };
     }
@@ -559,11 +918,31 @@ fn read_render_info(
             properties.depth_factor = 1.0;
         }
     }
-    let _channel_lock = bits.read_bit()?;
+    properties.snap = bits.read_bit()?;
     Ok(())
 }
 
+fn read_divergence(bits: &mut BitReader<'_>, previous: f32) -> Result<f32, AppError> {
+    if !bits.read_bit()? {
+        return Ok(0.0);
+    }
+    match bits.read_u8(2)? {
+        0 => Ok(DIVERGENCE_TABLE[bits.read_usize(2)?]),
+        1 => Ok(previous),
+        2 => {
+            let code = bits.read_usize(6)?;
+            DIVERGENCE_CODES[code].ok_or_else(|| unsupported("reserved OAMD divergence code 0"))
+        }
+        reserved => Err(unsupported(format!(
+            "reserved OAMD divergence mode {reserved}"
+        ))),
+    }
+}
+
 fn append_standard_bed(mask: u16, result: &mut Vec<Speaker>) {
+    // OAMD arrays are sent from index 0, so an MSB-first integer reader puts
+    // the final array element (RC_L/RC_R) in the numeric least-significant bit.
+    // Iterating numeric bits upward therefore also preserves bed-object order.
     const LABELS: [&[Speaker]; 10] = [
         &[Speaker::FrontLeft, Speaker::FrontRight],
         &[Speaker::FrontCenter],
@@ -584,6 +963,8 @@ fn append_standard_bed(mask: u16, result: &mut Vec<Speaker>) {
 }
 
 fn append_nonstandard_bed(mask: u32, result: &mut Vec<Speaker>) {
+    // Numeric bit 0 is the final transmitted array element (RC_L), while
+    // numeric bit 16 is the first one (RC_LFE2).
     const LABELS: [Speaker; 17] = [
         Speaker::FrontLeft,
         Speaker::FrontRight,
@@ -628,11 +1009,29 @@ fn unsupported(message: impl Into<String>) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OamdDecoder, append_standard_bed, room_position};
-    use crate::{eac3::MetadataPayload, hrir::Speaker};
+    use super::{
+        OamdDecoder, ObjectProperties, ProgramAssignment, append_nonstandard_bed,
+        append_standard_bed, read_divergence, read_render_info, read_trim_element, room_position,
+    };
+    use crate::{
+        eac3::{BitReader, MetadataPayload},
+        hrir::Speaker,
+        object::ObjectTrimMode,
+    };
 
     #[test]
-    fn standard_bed_mask_uses_lsb_label_order() {
+    fn bed_masks_preserve_object_order_after_msb_first_reading() {
+        let mut standard_edges = Vec::new();
+        append_standard_bed(1 | (1 << 9), &mut standard_edges);
+        assert_eq!(
+            standard_edges,
+            [Speaker::FrontLeft, Speaker::FrontRight, Speaker::Lfe,]
+        );
+
+        let mut nonstandard_edges = Vec::new();
+        append_nonstandard_bed(1 | (1 << 16), &mut nonstandard_edges);
+        assert_eq!(nonstandard_edges, [Speaker::FrontLeft, Speaker::Lfe]);
+
         let mut speakers = Vec::new();
         append_standard_bed(0b1_0000_1101, &mut speakers);
         assert_eq!(
@@ -650,10 +1049,109 @@ mod tests {
     }
 
     #[test]
+    fn reserved_object_size_index_is_rejected() {
+        let mut properties = ObjectProperties::default();
+        let error = read_render_info(&mut BitReader::new(&[0b0100_1100]), &mut properties, 3, 1)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved OAMD object size index 3")
+        );
+    }
+
+    #[test]
+    fn render_info_retains_finite_and_infinite_distance() {
+        let mut finite = ObjectProperties::default();
+        read_render_info(
+            &mut BitReader::new(&[0x17, 0xc0, 0x84, 0xe0]),
+            &mut finite,
+            3,
+            0,
+        )
+        .unwrap();
+        assert_eq!(finite.distance_factor, Some(5.0));
+
+        let mut infinite = ObjectProperties::default();
+        read_render_info(
+            &mut BitReader::new(&[0x17, 0xc0, 0x86]),
+            &mut infinite,
+            3,
+            0,
+        )
+        .unwrap();
+        assert!(infinite.distance_factor.is_some_and(f32::is_infinite));
+    }
+
+    #[test]
     #[allow(clippy::float_cmp)] // Boundary values are exactly representable.
     fn room_coordinates_map_to_renderer_axes() {
         assert_eq!(room_position([0.0, 0.0, -1.0]), [-1.0, 1.0, -1.0]);
         assert_eq!(room_position([1.0, 1.0, 1.0]), [1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn divergence_decodes_table_code_and_reuse_modes() {
+        let table = read_divergence(&mut BitReader::new(&[0b1001_0000]), 0.25).unwrap();
+        assert!((table - 0.704_833).abs() < f32::EPSILON);
+
+        let reuse = read_divergence(&mut BitReader::new(&[0b1010_0000]), 0.25).unwrap();
+        assert!((reuse - 0.25).abs() < f32::EPSILON);
+
+        let code = read_divergence(&mut BitReader::new(&[0b1101_1111, 0b1000_0000]), 0.0).unwrap();
+        assert!((code - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn reserved_divergence_syntax_is_rejected() {
+        assert!(read_divergence(&mut BitReader::new(&[0b1100_0000, 0]), 0.0).is_err());
+        assert!(read_divergence(&mut BitReader::new(&[0b1110_0000]), 0.0).is_err());
+    }
+
+    #[test]
+    fn program_assignment_accepts_every_defined_isf_size() {
+        for (index, expected) in [4, 8, 10, 14, 15, 30].into_iter().enumerate() {
+            let encoded = 0b0001_0000 | u8::try_from(index).unwrap();
+            let assignment =
+                ProgramAssignment::read(&mut BitReader::new(&[encoded]), expected).unwrap();
+            assert_eq!(assignment.isf_object_count, expected);
+        }
+    }
+
+    #[test]
+    fn decodes_custom_trim_and_warp_metadata() {
+        // warp Y, custom global mode, configuration 0 centre trim -6 dB,
+        // configurations 1..8 default, no per-object disables.
+        let trim = read_trim_element(&mut BitReader::new(&[0x48, 0x0c, 0x7f, 0x80]), 1).unwrap();
+        let object = trim.for_object(0);
+        assert!(object.warp_y);
+        let settings = object.settings(0);
+        assert_eq!(settings.mode, ObjectTrimMode::Custom);
+        assert!((settings.center_db + 6.0).abs() < f32::EPSILON);
+        assert!(settings.surround_db.abs() < f32::EPSILON);
+        assert!(settings.height_db.abs() < f32::EPSILON);
+        assert_eq!(object.settings(1).mode, ObjectTrimMode::Default);
+    }
+
+    #[test]
+    fn decodes_global_and_per_object_trim_modes() {
+        let default = read_trim_element(&mut BitReader::new(&[0]), 1).unwrap();
+        assert_eq!(
+            default.for_object(0).settings(0).mode,
+            ObjectTrimMode::Default
+        );
+
+        let disabled = read_trim_element(&mut BitReader::new(&[0x04]), 1).unwrap();
+        assert_eq!(
+            disabled.for_object(0).settings(0).mode,
+            ObjectTrimMode::Disabled
+        );
+
+        let object_disabled = read_trim_element(&mut BitReader::new(&[0x03]), 1).unwrap();
+        assert_eq!(
+            object_disabled.for_object(0).settings(0).mode,
+            ObjectTrimMode::Disabled
+        );
     }
 
     #[test]

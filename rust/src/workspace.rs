@@ -1,4 +1,5 @@
 use std::{
+    fs::File,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -128,15 +129,53 @@ impl AtomicOutput {
                 self.final_path.display()
             )));
         }
+        if self.final_path.exists() {
+            let permissions = self.final_path.metadata()?.permissions();
+            self.partial_path
+                .metadata()
+                .and_then(|_| std::fs::set_permissions(&self.partial_path, permissions))
+                .map_err(|source| AppError::File {
+                    path: self.partial_path.clone(),
+                    source,
+                })?;
+        }
+        File::open(&self.partial_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| AppError::File {
+                path: self.partial_path.clone(),
+                source,
+            })?;
         std::fs::rename(&self.partial_path, &self.final_path).map_err(|error| {
             AppError::Mux(format!(
                 "could not atomically publish {}: {error}",
                 self.final_path.display()
             ))
         })?;
+        sync_parent_directory(&self.final_path)?;
         self.directory.take();
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Usage(format!(
+            "output has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| AppError::File {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -173,5 +212,26 @@ mod tests {
             fs::write(output.partial_path(), b"unverified").unwrap();
         }
         assert!(!final_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_preserves_the_original_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("result.mkv");
+        fs::write(&final_path, b"original").unwrap();
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o764)).unwrap();
+        let output = AtomicOutput::new(&final_path, true).unwrap();
+        fs::write(output.partial_path(), b"verified").unwrap();
+
+        output.commit().unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), b"verified");
+        assert_eq!(
+            fs::metadata(final_path).unwrap().permissions().mode() & 0o777,
+            0o764
+        );
     }
 }

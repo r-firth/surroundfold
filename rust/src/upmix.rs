@@ -4,6 +4,7 @@ use crate::{
     binaural::BinauralWriter,
     error::AppError,
     hrir::{HrirSet, Speaker},
+    object::{ObjectTrim, ObjectZone},
     spatial::{SpatialPanner, direct_stereo_gains},
 };
 
@@ -62,13 +63,16 @@ impl ChannelProcessor {
             } else {
                 planned.speaker
             };
-            let resolved = hrir.resolved_speaker(speaker).ok_or_else(|| {
+            let ground_bus = if speaker == Speaker::Lfe {
+                writer.bus(Speaker::Lfe)
+            } else {
+                hrir.resolved_speaker(speaker)
+                    .and_then(|resolved| writer.bus(resolved))
+            }
+            .ok_or_else(|| {
                 AppError::InvalidHrir(format!(
                     "HRIR has no route for processed channel {speaker:?}"
                 ))
-            })?;
-            let ground_bus = writer.bus(resolved).ok_or_else(|| {
-                AppError::Render(format!("missing virtual-speaker bus for {resolved:?}"))
             })?;
             let eligible_for_height = options.upconvert
                 && speaker.position()[2] == 0.0
@@ -76,7 +80,17 @@ impl ChannelProcessor {
             let height = eligible_for_height
                 .then(|| HeightExtractor::new(hrir.sample_rate, HEIGHT_CROSSOVER_HZ));
             let height_gains = if height.is_some() {
-                panner.gains(speaker.position(), 0.0, 1.0)?
+                panner.gains(
+                    speaker.position(),
+                    [0.0; 3],
+                    1.0,
+                    false,
+                    ObjectZone::All,
+                    true,
+                    0.0,
+                    ObjectTrim::default(),
+                    false,
+                )?
             } else {
                 Vec::new()
             };
@@ -139,7 +153,17 @@ impl ChannelProcessor {
                     if split.height_changed {
                         let mut position = channel.speaker.position();
                         position[2] = extractor.height();
-                        channel.height_gains = self.panner.gains(position, 0.0, 1.0)?;
+                        channel.height_gains = self.panner.gains(
+                            position,
+                            [0.0; 3],
+                            1.0,
+                            false,
+                            ObjectZone::All,
+                            true,
+                            0.0,
+                            ObjectTrim::default(),
+                            false,
+                        )?;
                     }
                     if !(self.options.mute_ground && extractor.height() <= 0.0) {
                         for (bus, gain) in channel.height_gains.iter().copied().enumerate() {
@@ -171,7 +195,9 @@ fn route_static(
     sample: f32,
     speaker_virtualizer: bool,
 ) -> Result<(), AppError> {
-    if speaker_virtualizer && speaker.position()[2] == 0.0 {
+    if speaker == Speaker::Lfe {
+        writer.add(ground_bus, sample)
+    } else if speaker_virtualizer && speaker.position()[2] == 0.0 {
         let [left, right] = direct_stereo_gains(speaker);
         writer.add_direct(sample * left, sample * right);
         Ok(())
@@ -451,6 +477,7 @@ mod tests {
         let hrir = HrirSet {
             sample_rate: 48_000,
             channels: Vec::new(),
+            directional: Vec::new(),
         };
         let plan =
             MatrixPlan::new(&[Speaker::FrontLeft, Speaker::FrontRight], &hrir, true).unwrap();
@@ -488,6 +515,7 @@ mod tests {
         let hrir = HrirSet {
             sample_rate: 48_000,
             channels: vec![impulse(Speaker::RearLeft), impulse(Speaker::RearRight)],
+            directional: Vec::new(),
         };
         let plan =
             MatrixPlan::new(&[Speaker::FrontLeft, Speaker::FrontRight], &hrir, true).unwrap();

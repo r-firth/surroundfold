@@ -5,6 +5,7 @@ pub mod dsp;
 pub mod eac3;
 pub mod eac3_render;
 pub mod error;
+mod finishing;
 pub mod hrir;
 mod isf;
 mod isf_tables;
@@ -15,6 +16,7 @@ pub mod mux;
 pub mod oamd;
 pub mod object;
 mod object_render;
+mod parametric;
 pub mod paths;
 pub mod process;
 pub mod qmf;
@@ -31,7 +33,10 @@ pub mod truehd_render;
 pub(crate) mod upmix;
 pub mod workspace;
 
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    time::Instant,
+};
 
 use cancel::Cancellation;
 use cli::{Cli, ProgressMode, Toggle};
@@ -39,7 +44,10 @@ use eac3_render::{Eac3RenderOptions, render_eac3_track};
 use error::AppError;
 use hrir::HrirSet;
 use media::MediaProbe;
-use mux::{advanced_argument_pairs, build_mux_arguments, mux, verify_output};
+use mux::{
+    AppendedTrack, BINAURAL_TITLE, advanced_argument_pairs, build_mux_arguments, mux,
+    source_without_previous_outputs, verify_output,
+};
 use paths::ResolvedPaths;
 use process::ProcessRunner;
 use render::{ChannelRenderOptions, render_channel_track};
@@ -57,6 +65,7 @@ use workspace::{AtomicOutput, Workspace};
 /// rendering fails.
 #[allow(clippy::too_many_lines)] // Keeping the ordered transactional pipeline in one place aids auditing.
 pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
+    let total_started = Instant::now();
     let advanced = if cli.list_tracks {
         Vec::new()
     } else {
@@ -91,10 +100,10 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
         .output
         .as_deref()
         .ok_or_else(|| AppError::Usage("--output could not be resolved".into()))?;
-    let hrir = paths
-        .hrir
-        .as_deref()
-        .map_or_else(HrirSet::load_default, HrirSet::load_concatenated_wave)?;
+    let hrir = match paths.hrir.as_deref() {
+        Some(path) => HrirSet::load(path, selected_stream.sample_rate.unwrap_or(48_000))?,
+        None => HrirSet::load_default_at(selected_stream.sample_rate.unwrap_or(48_000))?,
+    };
     let room_correction = paths
         .room_correction
         .as_deref()
@@ -114,6 +123,8 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
             selected.capability
         ),
     );
+    let preparation_seconds = total_started.elapsed().as_secs_f64();
+    let render_started = Instant::now();
     report(cli.progress, "rendering binaural track");
     let render = match selected.capability {
         DecodeCapability::Channels => {
@@ -143,7 +154,6 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
         DecodeCapability::TrueHdObjects => {
             #[cfg(feature = "embedded-truehd")]
             {
-                let elementary = workspace.file("selected.thd")?;
                 render_truehd_track(
                     &runner,
                     &ffmpeg,
@@ -160,7 +170,6 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
                         mute_ground: cli.mute_ground.enabled(),
                         speaker_virtualizer: cli.speaker_virtualizer.enabled(),
                     },
-                    &elementary,
                     &rendered,
                 )?
             }
@@ -199,31 +208,73 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
             ));
         }
     };
+    let render_seconds = render_started.elapsed().as_secs_f64();
+    report(
+        cli.progress,
+        &format!("render complete in {render_seconds:.3}s"),
+    );
 
-    let atomic = AtomicOutput::new(output_path, cli.overwrite)?;
+    let encode_mux_started = Instant::now();
+    let appended_tracks = [AppendedTrack {
+        path: &rendered,
+        title: BINAURAL_TITLE,
+        codec: cli.output_codec,
+        sample_rate: render.sample_rate,
+        frames: render.frames,
+    }];
+
     let selected_start = selected_stream.start_time.unwrap_or(0.0);
+    let replacement_source = source_without_previous_outputs(&manifest);
+    let replacement_selected_stream = replacement_source
+        .streams
+        .iter()
+        .find(|stream| stream.index == selected_stream.index)
+        .ok_or_else(|| {
+            AppError::Usage(
+                "a previous SurroundFold output track cannot be selected as the render source"
+                    .into(),
+            )
+        })?;
+    let atomic = AtomicOutput::new(output_path, paths.in_place || cli.overwrite)?;
     let mux_arguments = build_mux_arguments(
         &paths.input,
-        &rendered,
+        &appended_tracks,
         atomic.partial_path(),
-        &manifest,
-        selected_stream,
+        &replacement_source,
+        replacement_selected_stream,
         selected_start,
         &advanced,
     )?;
-    report(cli.progress, "muxing preservation copy");
+    report(
+        cli.progress,
+        "encoding delivery track and muxing preservation copy",
+    );
     mux(&runner, &ffmpeg, &mux_arguments)?;
+    let encode_mux_seconds = encode_mux_started.elapsed().as_secs_f64();
+    report(
+        cli.progress,
+        &format!("encode + preservation mux complete in {encode_mux_seconds:.3}s"),
+    );
+
+    let verification_started = Instant::now();
     report(cli.progress, "verifying preservation and synchronization");
     let output_manifest = probe.probe(atomic.partial_path())?;
     verify_output(
-        &manifest,
+        &replacement_source,
         &output_manifest,
-        selected_stream,
-        render.sample_rate,
-        render.frames,
+        replacement_selected_stream,
+        &appended_tracks,
         selected_start,
     )?;
     atomic.commit()?;
+    let verification_seconds = verification_started.elapsed().as_secs_f64();
+    let total_seconds = total_started.elapsed().as_secs_f64();
+    report(
+        cli.progress,
+        &format!(
+            "verification + publication complete in {verification_seconds:.3}s; total {total_seconds:.3}s"
+        ),
+    );
 
     match cli.progress {
         ProgressMode::Json => {
@@ -233,7 +284,19 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
                 "selectedTrack": selected,
                 "sampleRate": render.sample_rate,
                 "renderedSamples": render.frames,
+                "appendedTracks": appended_tracks
+                    .iter()
+                    .map(|track| track.title)
+                    .collect::<Vec<_>>(),
+                "outputCodec": cli.output_codec,
                 "peakBeforeLimiting": render.peak_before_limiting,
+                "timingsSeconds": {
+                    "preparation": preparation_seconds,
+                    "render": render_seconds,
+                    "encodeAndMux": encode_mux_seconds,
+                    "verificationAndPublication": verification_seconds,
+                    "total": total_seconds,
+                },
                 "tools": {
                     "ffmpeg": ffmpeg_version,
                     "ffprobe": ffprobe_version,

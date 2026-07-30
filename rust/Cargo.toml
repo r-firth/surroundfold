@@ -17,18 +17,21 @@ default = ["embedded-truehd"]
 embedded-truehd = ["dep:truehd"]
 
 [dependencies]
+audioadapter-buffers = "2.0.0"
 clap = { version = "4.6.4", features = ["derive"] }
 ctrlc = "3.5.2"
 hound = "3.5.1"
 log = "0.4.29"
 nix = { version = "0.31.3", features = ["signal"] }
 realfft = "3.5.0"
+rubato = "1.0.1"
 rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sofar = { version = "0.3.0", default-features = false, features = ["resample"] }
 tempfile = "3.27.0"
 thiserror = "2.0.19"
-truehd = { version = "=0.4.0", optional = true }
+truehd = { path = "vendor/truehd", optional = true }
 
 [lints.rust]
 unsafe_code = "deny"

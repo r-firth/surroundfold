@@ -60,7 +60,7 @@ pub fn render_eac3_track(
     let source_speakers = source_layout(stream.channel_layout.as_deref(), source_channels)?;
     if stream.sample_rate != Some(hrir.sample_rate) {
         return Err(AppError::UnsupportedInput(format!(
-            "DD+/Atmos sample rate {} does not match HRIR sample rate {}; object-domain resampling is not implemented yet",
+            "DD+/Atmos sample rate {} does not match the prepared HRIR rate {}",
             stream
                 .sample_rate
                 .map_or_else(|| "unknown".into(), |rate| rate.to_string()),

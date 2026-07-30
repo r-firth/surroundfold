@@ -24,12 +24,18 @@ use crate::{
     error::AppError,
     hrir::Speaker,
     isf::IsfConfig,
-    object::{IsfState, ObjectState, SpatialUpdate},
+    object::{
+        IsfState, ObjectState, ObjectTrim, ObjectTrimMode, ObjectTrimSettings, ObjectZone,
+        SpatialUpdate, interpolate_screen_geometry, project_room_distance,
+    },
     stream_io::read_up_to,
 };
 
 const INPUT_CHUNK_BYTES: usize = 64 * 1024;
 const PCM_24BIT_SCALE: f32 = 8_388_608.0;
+const DISTANCE_FACTORS: [f32; 16] = [
+    1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrueHdFrame {
@@ -298,8 +304,6 @@ fn metadata_updates(
         }]);
     };
     let positions = payload.get_damf_pos();
-    let dynamic_start =
-        payload.program_assignment.num_bed_objects + payload.program_assignment.num_isf_objects;
     let dynamic_count = payload.program_assignment.num_dynamic_objects;
     let described_channels = bed_speakers
         .len()
@@ -317,17 +321,18 @@ fn metadata_updates(
     if block_count == 0 {
         return Ok(Vec::new());
     }
+    let block_metadata = BlockMetadata {
+        element,
+        extended: payload.extended_object_element.as_ref(),
+        trim: payload.trim_element.as_ref(),
+        positions: &positions,
+        bed_speakers: &bed_speakers,
+        isf_count: payload.program_assignment.num_isf_objects,
+        dynamic_count,
+    };
     (0..block_count)
         .map(|block_index| {
-            let states = states_for_block(
-                element,
-                &positions,
-                bed_speakers.len(),
-                payload.program_assignment.num_isf_objects,
-                dynamic_start,
-                dynamic_count,
-                block_index,
-            )?;
+            let states = states_for_block(&block_metadata, block_index)?;
             let timing = element
                 .md_update_info
                 .block_update_info
@@ -366,20 +371,27 @@ fn metadata_updates(
         .collect()
 }
 
+struct BlockMetadata<'a> {
+    element: &'a truehd::structs::oamd::ObjectElement,
+    extended: Option<&'a truehd::structs::oamd::ExtendedObjectElement>,
+    trim: Option<&'a truehd::structs::oamd::TrimElement>,
+    positions: &'a [Vec<[f64; 3]>],
+    bed_speakers: &'a [Speaker],
+    isf_count: usize,
+    dynamic_count: usize,
+}
+
 #[allow(clippy::cast_possible_truncation)] // OAMD coordinates are deliberately reduced to f32 DSP.
 fn states_for_block(
-    element: &truehd::structs::oamd::ObjectElement,
-    positions: &[Vec<[f64; 3]>],
-    bed_count: usize,
-    isf_count: usize,
-    dynamic_start: usize,
-    dynamic_count: usize,
+    metadata: &BlockMetadata<'_>,
     block_index: usize,
 ) -> Result<BlockStates, AppError> {
-    let isf = (0..isf_count)
+    let bed_count = metadata.bed_speakers.len();
+    let isf = (0..metadata.isf_count)
         .map(|isf_index| {
             let metadata_index = bed_count + isf_index;
-            let info = element
+            let info = metadata
+                .element
                 .object_data
                 .get(metadata_index)
                 .and_then(|blocks| blocks.get(block_index))
@@ -392,38 +404,132 @@ fn states_for_block(
                 source_channel: metadata_index,
                 active: !info.b_object_not_active,
                 gain: object_gain(info.object_basic_info.object_gain),
+                trim: object_trim(metadata.trim, metadata_index)?,
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
-    let objects = (0..dynamic_count)
-        .map(|dynamic_index| {
-            let metadata_index = dynamic_start + dynamic_index;
-            let info = element
+    let beds = metadata
+        .bed_speakers
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(metadata_index, speaker)| {
+            let info = metadata
+                .element
                 .object_data
                 .get(metadata_index)
                 .and_then(|blocks| blocks.get(block_index))
                 .ok_or_else(|| {
                     AppError::Render(format!(
-                        "TrueHD metadata is missing block {block_index} for dynamic object {dynamic_index}"
+                        "TrueHD metadata is missing block {block_index} for bed object {metadata_index}"
                     ))
                 })?;
-            let position = positions
-                .get(metadata_index)
-                .and_then(|blocks| blocks.get(block_index))
-                .copied()
-                .unwrap_or([0.0, 0.0, 0.0])
-                .map(|value| value as f32);
             Ok(ObjectState {
-                source_channel: bed_count + isf_count + dynamic_index,
+                source_channel: metadata_index,
                 active: !info.b_object_not_active,
-                bed: false,
-                position,
+                bed_speaker: Some(speaker),
+                position: speaker.position(),
+                distance_factor: None,
                 gain: object_gain(info.object_basic_info.object_gain),
-                size: info.object_render_info.object_size[0] as f32,
+                size: [0.0; 3],
+                snap: false,
+                zone: ObjectZone::All,
+                elevation: true,
+                divergence: 0.0,
+                trim: object_trim(metadata.trim, metadata_index)?,
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
+    let dynamic = (0..metadata.dynamic_count)
+        .map(|dynamic_index| dynamic_state(metadata, block_index, dynamic_index))
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let objects = beds.into_iter().chain(dynamic).collect();
     Ok(BlockStates { isf, objects })
+}
+
+#[allow(clippy::cast_possible_truncation)] // OAMD coordinates are deliberately reduced to f32 DSP.
+fn dynamic_state(
+    metadata: &BlockMetadata<'_>,
+    block_index: usize,
+    dynamic_index: usize,
+) -> Result<ObjectState, AppError> {
+    let bed_count = metadata.bed_speakers.len();
+    let metadata_index = bed_count + metadata.isf_count + dynamic_index;
+    let info = metadata
+        .element
+        .object_data
+        .get(metadata_index)
+        .and_then(|blocks| blocks.get(block_index))
+        .ok_or_else(|| {
+            AppError::Render(format!(
+                "TrueHD metadata is missing block {block_index} for dynamic object {dynamic_index}"
+            ))
+        })?;
+    let position = metadata
+        .positions
+        .get(metadata_index)
+        .and_then(|blocks| blocks.get(block_index))
+        .copied()
+        .unwrap_or([0.0, 0.0, 0.0])
+        .map(|value| value as f32);
+    let size = info
+        .object_render_info
+        .object_size
+        .map(|value| value as f32);
+    let screen_anchored = info.object_render_info.b_object_use_screen_ref;
+    let (position, size) = if screen_anchored {
+        interpolate_screen_geometry(
+            position,
+            size,
+            info.object_render_info.screen_factor as f32,
+            info.object_render_info.depth_factor as f32,
+        )
+    } else {
+        (position, size)
+    };
+    let distance_factor = info
+        .object_render_info
+        .b_object_distance_specified
+        .then(|| {
+            if info.object_render_info.b_object_at_infinity {
+                Ok(f32::INFINITY)
+            } else {
+                DISTANCE_FACTORS
+                    .get(usize::from(info.object_render_info.distance_factor_idx))
+                    .copied()
+                    .ok_or_else(|| {
+                        AppError::UnsupportedInput(format!(
+                            "invalid TrueHD OAMD distance index {}",
+                            info.object_render_info.distance_factor_idx
+                        ))
+                    })
+            }
+        })
+        .transpose()?;
+    let divergence = metadata
+        .extended
+        .and_then(|extended| extended.object_div_block.get(metadata_index))
+        .and_then(|blocks| blocks.get(block_index))
+        .filter(|block| block.b_object_divergence)
+        .map_or(0.0, |block| block.object_divergence as f32);
+    Ok(ObjectState {
+        source_channel: metadata_index,
+        active: !info.b_object_not_active,
+        bed_speaker: None,
+        position: project_room_distance(position, distance_factor),
+        distance_factor,
+        gain: object_gain(info.object_basic_info.object_gain),
+        size,
+        snap: info.object_render_info.b_object_snap && !screen_anchored,
+        zone: ObjectZone::try_from(info.object_render_info.zone_constraints_idx).map_err(
+            |reserved| {
+                AppError::UnsupportedInput(format!("reserved TrueHD OAMD zone index {reserved}"))
+            },
+        )?,
+        elevation: info.object_render_info.b_enable_elevation,
+        divergence,
+        trim: object_trim(metadata.trim, metadata_index)?,
+    })
 }
 
 struct BlockStates {
@@ -437,6 +543,90 @@ fn object_gain(gain_db: i8) -> f32 {
     } else {
         10_f32.powf(f32::from(gain_db) / 20.0)
     }
+}
+
+#[allow(clippy::cast_possible_truncation)] // OAMD trim values are bounded table entries.
+fn object_trim(
+    element: Option<&truehd::structs::oamd::TrimElement>,
+    object_index: usize,
+) -> Result<ObjectTrim, AppError> {
+    let Some(element) = element else {
+        return Ok(ObjectTrim::default_algorithm());
+    };
+    let warp_y = match element.warp_mode {
+        0 => false,
+        1 => true,
+        reserved => {
+            return Err(AppError::UnsupportedInput(format!(
+                "reserved TrueHD OAMD warp mode {reserved}"
+            )));
+        }
+    };
+    if element.global_trim_mode == 3 {
+        return Err(AppError::UnsupportedInput(
+            "reserved TrueHD OAMD global trim mode 3".into(),
+        ));
+    }
+    let object_disabled = if element.b_disable_trim_per_obj {
+        *element.b_disable_trim.get(object_index).ok_or_else(|| {
+            AppError::Render(format!(
+                "TrueHD OAMD trim metadata is missing object {object_index}"
+            ))
+        })?
+    } else {
+        false
+    };
+    if object_disabled || element.global_trim_mode == 1 {
+        return Ok(ObjectTrim::uniform(warp_y, ObjectTrimSettings::default()));
+    }
+    if element.global_trim_mode == 0 {
+        return Ok(ObjectTrim::uniform(
+            warp_y,
+            ObjectTrimSettings {
+                mode: ObjectTrimMode::Default,
+                ..ObjectTrimSettings::default()
+            },
+        ));
+    }
+
+    let mut configurations = [ObjectTrimSettings::default(); 9];
+    for (configuration, encoded) in element.trims.iter().enumerate() {
+        let Some(encoded) = encoded else {
+            configurations[configuration] = ObjectTrimSettings {
+                mode: ObjectTrimMode::Default,
+                ..ObjectTrimSettings::default()
+            };
+            continue;
+        };
+        configurations[configuration] = if encoded.b_default_trim {
+            ObjectTrimSettings {
+                mode: ObjectTrimMode::Default,
+                ..ObjectTrimSettings::default()
+            }
+        } else if encoded.b_disable_trim {
+            ObjectTrimSettings::default()
+        } else {
+            for (name, value) in [
+                ("surround", encoded.trim_surround),
+                ("height", encoded.trim_height),
+            ] {
+                if value.is_some_and(|db| db > -0.75) {
+                    return Err(AppError::UnsupportedInput(format!(
+                        "reserved TrueHD OAMD {name} trim value"
+                    )));
+                }
+            }
+            ObjectTrimSettings {
+                mode: ObjectTrimMode::Custom,
+                center_db: encoded.trim_centre.unwrap_or(0.0) as f32,
+                surround_db: encoded.trim_surround.unwrap_or(0.0) as f32,
+                height_db: encoded.trim_height.unwrap_or(0.0) as f32,
+                top_bottom_balance: encoded.bal3d_y_tb.unwrap_or(0.0) as f32,
+                listener_balance: encoded.bal3d_y_lis.unwrap_or(0.0) as f32,
+            }
+        };
+    }
+    Ok(ObjectTrim::from_configurations(warp_y, configurations))
 }
 
 fn scale_oamd_samples(samples: usize, sample_rate: u32) -> Result<usize, AppError> {
@@ -510,13 +700,15 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use crate::object::ObjectTrimMode;
     use truehd::process::EXAMPLE_DATA;
     use truehd::structs::oamd::{
-        BlockUpdateInfo, MDUpdateInfo, ObjectAudioMetadataPayload, ObjectElement, ObjectInfoBlock,
-        ProgramAssignment,
+        BedAssignment, BlockUpdateInfo, ExtendedObjectElement, MDUpdateInfo,
+        ObjectAudioMetadataPayload, ObjectDivergenceBlock, ObjectElement, ObjectInfoBlock,
+        ObjectRenderInfo, ProgramAssignment, Trim, TrimElement,
     };
 
-    use super::{decode_stream, metadata_updates};
+    use super::{Speaker, decode_stream, metadata_updates};
 
     #[test]
     fn embedded_example_decodes_without_leaking_decoder_types() {
@@ -571,5 +763,149 @@ mod tests {
         assert_eq!(updates[0].ramp_samples, 64);
         assert_eq!(updates[1].sample_offset, 144);
         assert_eq!(updates[1].ramp_samples, 128);
+    }
+
+    #[test]
+    fn isf_signals_precede_dynamic_objects_in_decoder_channel_order() {
+        let mut object_data = vec![vec![ObjectInfoBlock::default()]; 5];
+        for blocks in &mut object_data {
+            blocks[0].object_basic_info.object_gain = 0;
+        }
+        let payload = ObjectAudioMetadataPayload {
+            object_count: 5,
+            program_assignment: ProgramAssignment {
+                num_isf_objects: 4,
+                num_dynamic_objects: 1,
+                ..ProgramAssignment::default()
+            },
+            object_element: Some(ObjectElement {
+                md_update_info: MDUpdateInfo {
+                    num_obj_info_blocks: 1,
+                    block_update_info: vec![BlockUpdateInfo::default()],
+                    ..MDUpdateInfo::default()
+                },
+                object_data,
+                ..ObjectElement::default()
+            }),
+            ..ObjectAudioMetadataPayload::default()
+        };
+
+        let updates = metadata_updates(&payload, 5, 48_000).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0]
+                .isf
+                .iter()
+                .map(|state| state.source_channel)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(updates[0].objects[0].source_channel, 4);
+        assert_eq!(
+            updates[0].objects[0].trim.settings(8).mode,
+            ObjectTrimMode::Default
+        );
+    }
+
+    #[test]
+    fn bed_gain_and_custom_trim_reach_the_renderer() {
+        let mut trims = std::array::from_fn(|_| None);
+        trims[2] = Some(Trim {
+            b_default_trim: false,
+            b_disable_trim: false,
+            trim_centre: Some(-6.0),
+            trim_surround: Some(-3.0),
+            trim_height: None,
+            bal3d_y_tb: None,
+            bal3d_y_lis: Some(-0.5),
+        });
+        let mut info = ObjectInfoBlock::default();
+        info.object_basic_info.object_gain = -6;
+        let payload = ObjectAudioMetadataPayload {
+            object_count: 1,
+            program_assignment: ProgramAssignment {
+                bed_assignment: vec![BedAssignment::from_non_std(1 << 2)],
+                num_bed_objects: 1,
+                ..ProgramAssignment::default()
+            },
+            object_element: Some(ObjectElement {
+                md_update_info: MDUpdateInfo {
+                    num_obj_info_blocks: 1,
+                    block_update_info: vec![BlockUpdateInfo::default()],
+                    ..MDUpdateInfo::default()
+                },
+                object_data: vec![vec![info]],
+                ..ObjectElement::default()
+            }),
+            trim_element: Some(TrimElement {
+                warp_mode: 1,
+                global_trim_mode: 2,
+                trims,
+                ..TrimElement::default()
+            }),
+            ..ObjectAudioMetadataPayload::default()
+        };
+
+        let state = &metadata_updates(&payload, 1, 48_000).unwrap()[0].objects[0];
+        assert_eq!(state.bed_speaker, Some(Speaker::FrontCenter));
+        assert!((state.gain - 10_f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+        assert!(state.trim.warp_y);
+        let trim = state.trim.settings(2);
+        assert_eq!(trim.mode, ObjectTrimMode::Custom);
+        assert!((trim.center_db + 6.0).abs() < f32::EPSILON);
+        assert!((trim.surround_db + 3.0).abs() < f32::EPSILON);
+        assert!((trim.listener_balance + 0.5).abs() < f32::EPSILON);
+        assert_eq!(state.trim.settings(1).mode, ObjectTrimMode::Default);
+    }
+
+    #[test]
+    fn screen_reference_distance_and_divergence_reach_the_render_state() {
+        let payload = ObjectAudioMetadataPayload {
+            object_count: 1,
+            program_assignment: ProgramAssignment {
+                num_dynamic_objects: 1,
+                ..ProgramAssignment::default()
+            },
+            object_element: Some(ObjectElement {
+                md_update_info: MDUpdateInfo {
+                    num_obj_info_blocks: 1,
+                    block_update_info: vec![BlockUpdateInfo::default()],
+                    ..MDUpdateInfo::default()
+                },
+                b_reserved_data_not_present: false,
+                reserved_data: 31,
+                object_data: vec![vec![ObjectInfoBlock {
+                    object_render_info: ObjectRenderInfo {
+                        pos3d: [0.0, 0.0, 1.0],
+                        b_object_use_screen_ref: true,
+                        screen_factor: 1.0,
+                        depth_factor: 1.0,
+                        b_object_distance_specified: true,
+                        distance_factor_idx: 7,
+                        b_object_snap: true,
+                        ..ObjectRenderInfo::default()
+                    },
+                    ..ObjectInfoBlock::default()
+                }]],
+            }),
+            extended_object_element: Some(ExtendedObjectElement {
+                b_obj_div_block: true,
+                object_div_block: vec![vec![ObjectDivergenceBlock {
+                    b_object_divergence: true,
+                    object_divergence: 0.704_833,
+                    ..ObjectDivergenceBlock::default()
+                }]],
+                ..ExtendedObjectElement::default()
+            }),
+            ..ObjectAudioMetadataPayload::default()
+        };
+
+        let object = &metadata_updates(&payload, 1, 48_000).unwrap()[0].objects[0];
+        assert_eq!(object.distance_factor, Some(5.0));
+        assert!((object.position[0] + 2.5).abs() < f32::EPSILON);
+        assert!((object.position[1] - 5.0).abs() < f32::EPSILON);
+        assert!((object.position[2] - 2.5 / 1.78).abs() < 1e-6);
+        assert!((object.divergence - 0.704_833).abs() < f32::EPSILON);
+        assert!(!object.snap);
     }
 }

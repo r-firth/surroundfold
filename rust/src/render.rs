@@ -34,7 +34,7 @@ pub struct ChannelRenderOptions {
 }
 
 /// Decodes one selected channel-based stream, performs binaural convolution,
-/// and writes deterministic stereo 16-bit PCM.
+/// and writes deterministic, dithered stereo 24-bit PCM.
 ///
 /// # Errors
 ///
@@ -249,7 +249,10 @@ pub(crate) fn source_layout(
 ) -> Result<Vec<Speaker>, AppError> {
     use Speaker::{
         FrontCenter as C, FrontLeft as L, FrontRight as R, Lfe, RearCenter as Rc, RearLeft as Rl,
-        RearRight as Rr, SideLeft as Sl, SideRight as Sr,
+        RearRight as Rr, SideLeft as Sl, SideRight as Sr, TopFrontCenter as Tfc,
+        TopFrontLeft as Tfl, TopFrontRight as Tfr, TopRearCenter as Trc, TopRearLeft as Trl,
+        TopRearRight as Trr, TopSideLeft as Tsl, TopSideRight as Tsr, WideLeft as Wl,
+        WideRight as Wr,
     };
     let known: Option<&[Speaker]> = match layout.unwrap_or_default() {
         "mono" => Some(&[C]),
@@ -257,15 +260,42 @@ pub(crate) fn source_layout(
         "2.1" => Some(&[L, R, Lfe]),
         "3.0" => Some(&[L, R, C]),
         "3.0(back)" => Some(&[L, R, Rc]),
+        "3.1" => Some(&[L, R, C, Lfe]),
         "4.0" => Some(&[L, R, C, Rc]),
         "quad" => Some(&[L, R, Rl, Rr]),
         "quad(side)" => Some(&[L, R, Sl, Sr]),
+        "4.1" => Some(&[L, R, C, Lfe, Rc]),
         "5.0" => Some(&[L, R, C, Rl, Rr]),
         "5.0(side)" => Some(&[L, R, C, Sl, Sr]),
         "5.1" => Some(&[L, R, C, Lfe, Rl, Rr]),
         "5.1(side)" => Some(&[L, R, C, Lfe, Sl, Sr]),
+        "6.0" => Some(&[L, R, C, Rc, Sl, Sr]),
+        "6.0(front)" => Some(&[L, R, Wl, Wr, Sl, Sr]),
+        "3.1.2" => Some(&[L, R, C, Lfe, Tfl, Tfr]),
+        "hexagonal" => Some(&[L, R, C, Rl, Rr, Rc]),
         "6.1" => Some(&[L, R, C, Lfe, Rc, Sl, Sr]),
+        "6.1(back)" => Some(&[L, R, C, Lfe, Rl, Rr, Rc]),
+        "6.1(front)" => Some(&[L, R, Lfe, Wl, Wr, Sl, Sr]),
+        "7.0" => Some(&[L, R, C, Rl, Rr, Sl, Sr]),
+        "7.0(front)" => Some(&[L, R, C, Wl, Wr, Sl, Sr]),
         "7.1" => Some(&[L, R, C, Lfe, Rl, Rr, Sl, Sr]),
+        "7.1(wide)" => Some(&[L, R, C, Lfe, Rl, Rr, Wl, Wr]),
+        "7.1(wide-side)" => Some(&[L, R, C, Lfe, Wl, Wr, Sl, Sr]),
+        "5.1.2" => Some(&[L, R, C, Lfe, Sl, Sr, Tfl, Tfr]),
+        "5.1.2(back)" => Some(&[L, R, C, Lfe, Rl, Rr, Tfl, Tfr]),
+        "octagonal" => Some(&[L, R, C, Rl, Rr, Rc, Sl, Sr]),
+        "cube" => Some(&[L, R, Rl, Rr, Tfl, Tfr, Trl, Trr]),
+        "5.1.4" => Some(&[L, R, C, Lfe, Sl, Sr, Tfl, Tfr, Trl, Trr]),
+        "7.1.2" => Some(&[L, R, C, Lfe, Rl, Rr, Sl, Sr, Tfl, Tfr]),
+        "7.1.4" => Some(&[L, R, C, Lfe, Rl, Rr, Sl, Sr, Tfl, Tfr, Trl, Trr]),
+        "7.2.3" => Some(&[L, R, C, Lfe, Rl, Rr, Sl, Sr, Tfl, Tfr, Trc, Lfe]),
+        "9.1.4" => Some(&[L, R, C, Lfe, Rl, Rr, Wl, Wr, Sl, Sr, Tfl, Tfr, Trl, Trr]),
+        "9.1.6" => Some(&[
+            L, R, C, Lfe, Rl, Rr, Wl, Wr, Sl, Sr, Tfl, Tfr, Trl, Trr, Tsl, Tsr,
+        ]),
+        "hexadecagonal" => Some(&[
+            L, R, C, Rl, Rr, Rc, Sl, Sr, Tfl, Tfc, Tfr, Trl, Trc, Trr, Wl, Wr,
+        ]),
         _ => None,
     };
     let speakers = known
@@ -340,5 +370,43 @@ mod tests {
     #[test]
     fn mismatched_layout_is_rejected() {
         assert!(source_layout(Some("stereo"), 6).is_err());
+    }
+
+    #[test]
+    fn named_immersive_layouts_do_not_fall_back_to_channel_count() {
+        use Speaker::{
+            FrontCenter as C, FrontLeft as L, FrontRight as R, Lfe, RearLeft as Rl,
+            RearRight as Rr, SideLeft as Sl, SideRight as Sr, TopFrontLeft as Tfl,
+            TopFrontRight as Tfr, TopRearCenter as Trc, TopRearLeft as Trl, TopRearRight as Trr,
+            TopSideLeft as Tsl, TopSideRight as Tsr, WideLeft as Wl, WideRight as Wr,
+        };
+
+        let cases: &[(&str, &[Speaker])] = &[
+            ("3.1.2", &[L, R, C, Lfe, Tfl, Tfr]),
+            ("5.1.2", &[L, R, C, Lfe, Sl, Sr, Tfl, Tfr]),
+            ("5.1.2(back)", &[L, R, C, Lfe, Rl, Rr, Tfl, Tfr]),
+            ("5.1.4", &[L, R, C, Lfe, Sl, Sr, Tfl, Tfr, Trl, Trr]),
+            ("7.1.2", &[L, R, C, Lfe, Rl, Rr, Sl, Sr, Tfl, Tfr]),
+            ("7.1.4", &[L, R, C, Lfe, Rl, Rr, Sl, Sr, Tfl, Tfr, Trl, Trr]),
+            ("7.2.3", &[L, R, C, Lfe, Rl, Rr, Sl, Sr, Tfl, Tfr, Trc, Lfe]),
+            (
+                "9.1.4",
+                &[L, R, C, Lfe, Rl, Rr, Wl, Wr, Sl, Sr, Tfl, Tfr, Trl, Trr],
+            ),
+            (
+                "9.1.6",
+                &[
+                    L, R, C, Lfe, Rl, Rr, Wl, Wr, Sl, Sr, Tfl, Tfr, Trl, Trr, Tsl, Tsr,
+                ],
+            ),
+        ];
+
+        for &(name, expected) in cases {
+            assert_eq!(
+                source_layout(Some(name), expected.len()).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
     }
 }

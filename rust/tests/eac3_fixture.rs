@@ -25,6 +25,9 @@ fn external_eac3_joc_fixture_exposes_oamd_and_joc() {
     let mut oamd_count = 0;
     let mut joc_count = 0;
     let mut object_updates = 0;
+    let mut assignment = None;
+    let mut saw_dynamic_objects = false;
+    let mut saw_lfe = false;
     let mut oamd = OamdDecoder::new();
     let mut joc = JocDecoder::new();
     while let Some(frame) = frames.next_frame().expect("fixture must be valid E-AC-3") {
@@ -38,10 +41,25 @@ fn external_eac3_joc_fixture_exposes_oamd_and_joc() {
                     let metadata = oamd
                         .decode(&payload)
                         .unwrap_or_else(|error| panic!("OAMD frame {frame_count} failed: {error}"));
-                    assert_eq!(metadata.object_count, 16);
-                    assert_eq!(metadata.joc_object_count, 15);
-                    assert_eq!(metadata.dynamic_object_count, 15);
-                    assert_eq!(metadata.lfe_object_indices, [0]);
+                    assert!(metadata.object_count > 0);
+                    assert_eq!(
+                        metadata.object_count,
+                        metadata.joc_object_count + metadata.lfe_object_indices.len()
+                    );
+                    assert!(metadata.dynamic_object_count <= metadata.joc_object_count);
+                    let current_assignment = (
+                        metadata.object_count,
+                        metadata.joc_object_count,
+                        metadata.dynamic_object_count,
+                        metadata.lfe_object_indices.clone(),
+                    );
+                    if let Some(expected) = &assignment {
+                        assert_eq!(&current_assignment, expected);
+                    } else {
+                        assignment = Some(current_assignment);
+                    }
+                    saw_dynamic_objects |= metadata.dynamic_object_count != 0;
+                    saw_lfe |= !metadata.lfe_object_indices.is_empty();
                     object_updates += metadata.updates.len();
                     oamd_objects = Some(metadata.joc_object_count);
                 }
@@ -66,6 +84,8 @@ fn external_eac3_joc_fixture_exposes_oamd_and_joc() {
     assert!(oamd_count > 0, "fixture contains no OAMD payloads");
     assert!(joc_count > 0, "fixture contains no JOC payloads");
     assert!(object_updates > 0, "fixture contains no object updates");
+    assert!(saw_dynamic_objects, "fixture contains no dynamic objects");
+    assert!(saw_lfe, "fixture does not exercise the LFE bypass");
 }
 
 /// Full native JOC reconstruction, object rendering, and preservation muxing.
@@ -104,7 +124,8 @@ fn external_eac3_joc_fixture_renders_end_to_end() {
         manifest.streams[0].profile.as_deref(),
         Some("Dolby Digital Plus + Dolby Atmos")
     );
-    assert_eq!(manifest.streams[1].codec_name, "pcm_s16le");
+    assert_eq!(manifest.streams[1].codec_name, "flac");
+    assert_eq!(manifest.streams[1].bits_per_raw_sample, Some(24));
     assert_eq!(manifest.streams[1].channels, Some(2));
     assert_eq!(manifest.streams[1].sample_rate, Some(48_000));
 

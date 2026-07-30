@@ -40,12 +40,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint default build
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy -p surroundfold --all-targets --locked --no-deps -- -D warnings
 
       - name: Lint without embedded TrueHD
         run: >-
-          cargo clippy --workspace --all-targets --locked
-          --no-default-features -- -D warnings
+          cargo clippy -p surroundfold --all-targets --locked
+          --no-default-features --no-deps -- -D warnings
 
       - name: Test default build
         run: cargo test --workspace --all-targets --locked
@@ -65,10 +65,17 @@ jobs:
       - name: Smoke release executable
         run: scripts/smoke-published.sh target/release/surroundfold
 
+      - name: Assemble licensed release artifact
+        run: |
+          package="target/release/surroundfold-macos-${{ matrix.arch }}"
+          mkdir -p "$package"
+          cp target/release/surroundfold "$package/surroundfold"
+          cp LICENSE THIRD_PARTY_NOTICES.md README.md "$package/"
+
       - uses: actions/upload-artifact@v4
         with:
           name: surroundfold-macos-${{ matrix.arch }}
-          path: target/release/surroundfold
+          path: target/release/surroundfold-macos-${{ matrix.arch }}
           if-no-files-found: error
 
   supply-chain:

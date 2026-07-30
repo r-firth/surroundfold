@@ -1,4 +1,10 @@
-use std::{fs::File, io::BufReader, path::Path};
+use std::{
+    ffi::OsString,
+    io::{BufReader, Read},
+    path::Path,
+    sync::mpsc::sync_channel,
+    thread,
+};
 
 use crate::{
     binaural::BinauralWriter,
@@ -6,7 +12,7 @@ use crate::{
     hrir::HrirSet,
     object_render::{ObjectPcmFrame, ObjectRenderOptions, ObjectRenderer},
     process::ProcessRunner,
-    render::{RenderResult, demux_copy},
+    render::RenderResult,
     room::RoomCorrection,
     truehd_adapter::decode_stream,
 };
@@ -39,18 +45,8 @@ pub fn render_truehd_track(
     hrir: &HrirSet,
     room_correction: Option<&RoomCorrection>,
     options: TrueHdRenderOptions,
-    elementary_path: &Path,
     output_wave: &Path,
 ) -> Result<RenderResult, AppError> {
-    demux_copy(
-        runner,
-        ffmpeg,
-        input,
-        stream_index,
-        "truehd",
-        "TrueHD",
-        elementary_path,
-    )?;
     let writer = BinauralWriter::new(
         output_wave,
         hrir,
@@ -68,17 +64,65 @@ pub fn render_truehd_track(
             speaker_virtualizer: options.speaker_virtualizer,
         },
     )?;
-    let source = File::open(elementary_path).map_err(|source| AppError::File {
-        path: elementary_path.to_path_buf(),
-        source,
+    let arguments = [
+        OsString::from("-nostdin"),
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-i"),
+        input.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from(format!("0:{stream_index}")),
+        OsString::from("-vn"),
+        OsString::from("-sn"),
+        OsString::from("-dn"),
+        OsString::from("-c:a"),
+        OsString::from("copy"),
+        OsString::from("-f"),
+        OsString::from("truehd"),
+        OsString::from("pipe:1"),
+    ];
+    let process = runner.run_with_stdout(ffmpeg, arguments, |stdout| {
+        decode_and_render(
+            BufReader::new(stdout),
+            runner,
+            options.presentation,
+            options.relaxed_validation,
+            &mut renderer,
+        )
     })?;
-    decode_stream(
-        BufReader::new(source),
-        options.presentation,
-        options.relaxed_validation,
-        |frame| {
-            runner.check_cancelled()?;
-            renderer.push(ObjectPcmFrame {
+    if !process.status.success() {
+        return Err(AppError::Render(format!(
+            "ffmpeg could not stream the selected TrueHD track ({}): {}",
+            process.status,
+            String::from_utf8_lossy(&process.stderr).trim()
+        )));
+    }
+    renderer.finish()
+}
+
+fn decode_and_render(
+    input: impl Read + Send,
+    runner: &ProcessRunner,
+    presentation: u8,
+    relaxed_validation: bool,
+    renderer: &mut ObjectRenderer<'_>,
+) -> Result<(), AppError> {
+    const PIPELINE_FRAMES: usize = 4;
+    let (sender, receiver) = sync_channel(PIPELINE_FRAMES);
+    thread::scope(|scope| {
+        let decoder = scope.spawn(move || {
+            decode_stream(input, presentation, relaxed_validation, |frame| {
+                runner.check_cancelled()?;
+                sender
+                    .send(frame)
+                    .map_err(|_| AppError::Render("TrueHD render pipeline stopped".into()))
+            })
+        });
+
+        let mut render_result = Ok(());
+        while let Ok(frame) = receiver.recv() {
+            if let Err(error) = renderer.push(ObjectPcmFrame {
                 sample_rate: frame.sample_rate,
                 sample_count: frame.sample_count,
                 channel_count: frame.channel_count,
@@ -86,8 +130,15 @@ pub fn render_truehd_track(
                 channel_speakers: frame.channel_speakers,
                 isf: frame.isf,
                 spatial_updates: frame.spatial_updates,
-            })
-        },
-    )?;
-    renderer.finish()
+            }) {
+                render_result = Err(error);
+                break;
+            }
+        }
+        drop(receiver);
+        let decode_result = decoder
+            .join()
+            .map_err(|_| AppError::Render("TrueHD decoder thread panicked".into()))?;
+        render_result.and(decode_result)
+    })
 }

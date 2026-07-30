@@ -51,9 +51,26 @@ output_path="$workspace/synthetic-output.mkv"
 
 audio_codecs="$("$ffprobe_path" -v error -select_streams a \
   -show_entries stream=codec_name -of csv=p=0 "$output_path" | tr -d '\r')"
+appended_codec="$("$ffprobe_path" -v error -select_streams a:1 \
+  -show_entries stream=codec_name -of default=nw=1:nk=1 "$output_path")"
+appended_depth="$("$ffprobe_path" -v error -select_streams a:1 \
+  -show_entries stream=bits_per_raw_sample -of default=nw=1:nk=1 "$output_path")"
+appended_channels="$("$ffprobe_path" -v error -select_streams a:1 \
+  -show_entries stream=channels -of default=nw=1:nk=1 "$output_path")"
+appended_layout="$("$ffprobe_path" -v error -select_streams a:1 \
+  -show_entries stream=channel_layout -of default=nw=1:nk=1 "$output_path")"
+appended_rate="$("$ffprobe_path" -v error -select_streams a:1 \
+  -show_entries stream=sample_rate -of default=nw=1:nk=1 "$output_path")"
+appended_default="$("$ffprobe_path" -v error -select_streams a:1 \
+  -show_entries stream_disposition=default -of default=nw=1:nk=1 "$output_path")"
 if ! grep -Fxq "eac3" <<<"$audio_codecs" ||
-    ! grep -Fxq "pcm_s16le" <<<"$audio_codecs"; then
-  echo "published smoke output did not preserve E-AC-3 and append PCM" >&2
+    [[ "$appended_codec" != "flac" ]] ||
+    [[ "$appended_depth" != "24" ]] ||
+    [[ "$appended_channels" != "2" ]] ||
+    [[ "$appended_layout" != "stereo" ]] ||
+    [[ "$appended_rate" != "48000" ]] ||
+    [[ "$appended_default" != "0" ]]; then
+  echo "published smoke output did not preserve E-AC-3 and append non-default lossless 48 kHz stereo 24-bit FLAC" >&2
   exit 1
 fi
 

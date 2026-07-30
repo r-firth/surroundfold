@@ -218,6 +218,8 @@ mod tests {
                 channels: Some(6),
                 channel_layout: Some("5.1(side)".into()),
                 sample_rate: Some(48_000),
+                bits_per_raw_sample: Some(24),
+                initial_padding: None,
                 start_time: None,
                 duration: None,
                 disposition: BTreeMap::new(),
