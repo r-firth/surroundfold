@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::BufWriter, path::Path};
+use std::{collections::HashMap, fs::File, io::BufWriter, path::Path, sync::Arc};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 
@@ -7,7 +7,7 @@ use crate::{
     error::AppError,
     finishing::FinishingEq,
     hrir::{HrirSet, Speaker},
-    parametric::apply_direction_shaped_parametric_hrtf,
+    parametric::{ParametricHrtfModel, apply_direction_shaped_parametric_hrtf},
     render::RenderResult,
     room::{RoomCorrection, StereoRoomCorrector},
 };
@@ -62,6 +62,7 @@ struct PreparedBuses {
     tail_blocks: Vec<usize>,
     panning_routes: Vec<PanningRoute>,
     maximum_impulse: usize,
+    parametric_model: Option<Arc<ParametricHrtfModel>>,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +215,7 @@ pub(crate) struct BinauralWriter {
     master_gain: f32,
     bus_by_speaker: HashMap<Speaker, usize>,
     panning_routes: Vec<PanningRoute>,
+    parametric_model: Option<Arc<ParametricHrtfModel>>,
     convolver: StereoConvolverBank,
     buses: Vec<Vec<f32>>,
     bus_has_input: Vec<bool>,
@@ -302,6 +304,7 @@ impl BinauralWriter {
             tail_blocks: bus_tail_blocks,
             panning_routes,
             maximum_impulse,
+            parametric_model,
         } = prepare_buses(hrir, &unique_speakers, parametric_hrtf)?;
         let correction_tail = room_correction.map_or(0, |correction| {
             correction
@@ -340,6 +343,7 @@ impl BinauralWriter {
             master_gain,
             bus_by_speaker,
             panning_routes,
+            parametric_model,
             buses: vec![vec![0.0; DEFAULT_CONVOLUTION_BLOCK]; bus_count],
             bus_has_input: vec![false; bus_count],
             bus_enabled: vec![false; bus_count],
@@ -378,6 +382,11 @@ impl BinauralWriter {
     }
 
     #[must_use]
+    pub(crate) fn parametric_model(&self) -> Option<Arc<ParametricHrtfModel>> {
+        self.parametric_model.clone()
+    }
+
+    #[must_use]
     pub(crate) fn bus_count(&self) -> usize {
         self.buses.len()
     }
@@ -388,7 +397,19 @@ impl BinauralWriter {
             .get_mut(bus)
             .ok_or_else(|| AppError::Render(format!("virtual-speaker bus {bus} does not exist")))?;
         let scaled = sample * self.master_gain;
+        if !scaled.is_finite() {
+            return Err(AppError::Render(format!(
+                "non-finite sample routed to virtual-speaker bus {bus} at frame {}",
+                self.input_frames
+            )));
+        }
         target[self.filled] += scaled;
+        if !target[self.filled].is_finite() {
+            return Err(AppError::Render(format!(
+                "virtual-speaker bus {bus} overflowed at frame {}",
+                self.input_frames
+            )));
+        }
         if scaled != 0.0 {
             self.bus_has_input[bus] = true;
         }
@@ -624,8 +645,13 @@ fn prepare_buses(
             direction: channel.direction,
         });
     }
-    if parametric_hrtf {
-        apply_direction_shaped_parametric_hrtf(&mut filters, &panning_routes, hrir.sample_rate);
+    let parametric_model = if parametric_hrtf {
+        apply_direction_shaped_parametric_hrtf(&mut filters, &panning_routes, hrir.sample_rate)
+            .map(Arc::new)
+    } else {
+        None
+    };
+    if parametric_model.is_some() {
         for (index, (left, right)) in filters.iter().enumerate() {
             let impulse_length = left.len().max(right.len());
             maximum_impulse = maximum_impulse.max(impulse_length);
@@ -643,6 +669,7 @@ fn prepare_buses(
         tail_blocks,
         panning_routes,
         maximum_impulse,
+        parametric_model,
     })
 }
 

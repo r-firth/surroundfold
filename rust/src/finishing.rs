@@ -4,9 +4,9 @@ pub(crate) const AAC_BITRATE: &str = "320k";
 pub(crate) const AAC_CODER: &str = "fast";
 pub(crate) const FLAC_COMPRESSION_LEVEL: &str = "0";
 
-const LOW_SHELF_HZ: f64 = 60.0;
-const LOW_SHELF_DB: f64 = 0.8;
-const LOW_SHELF_SLOPE: f64 = 0.7;
+const BASS_PEAK_HZ: f64 = 55.0;
+const BASS_PEAK_DB: f64 = 0.8;
+const BASS_PEAK_Q: f64 = 0.8;
 const LOW_MID_HZ: f64 = 240.0;
 const LOW_MID_DB: f64 = -0.8;
 const LOW_MID_Q: f64 = 0.65;
@@ -45,21 +45,9 @@ impl FilterChain {
     fn new(sample_rate: u32) -> Self {
         Self {
             filters: [
-                Biquad::shelf(
-                    sample_rate,
-                    LOW_SHELF_HZ,
-                    LOW_SHELF_SLOPE,
-                    LOW_SHELF_DB,
-                    Shelf::Low,
-                ),
+                Biquad::peaking(sample_rate, BASS_PEAK_HZ, BASS_PEAK_Q, BASS_PEAK_DB),
                 Biquad::peaking(sample_rate, LOW_MID_HZ, LOW_MID_Q, LOW_MID_DB),
-                Biquad::shelf(
-                    sample_rate,
-                    HIGH_SHELF_HZ,
-                    HIGH_SHELF_SLOPE,
-                    HIGH_SHELF_DB,
-                    Shelf::High,
-                ),
+                Biquad::high_shelf(sample_rate, HIGH_SHELF_HZ, HIGH_SHELF_SLOPE, HIGH_SHELF_DB),
             ],
         }
     }
@@ -70,12 +58,6 @@ impl FilterChain {
             .iter_mut()
             .fold(f64::from(sample), |value, filter| filter.process(value)) as f32
     }
-}
-
-#[derive(Clone, Copy)]
-enum Shelf {
-    Low,
-    High,
 }
 
 struct Biquad {
@@ -112,7 +94,7 @@ impl Biquad {
         )
     }
 
-    fn shelf(sample_rate: u32, frequency: f64, slope: f64, gain_db: f64, shelf: Shelf) -> Self {
+    fn high_shelf(sample_rate: u32, frequency: f64, slope: f64, gain_db: f64) -> Self {
         if frequency >= f64::from(sample_rate) * 0.5 {
             return Self::identity();
         }
@@ -123,32 +105,16 @@ impl Biquad {
             * 0.5
             * ((amplitude + amplitude.recip()) * (slope.recip() - 1.0) + 2.0).sqrt();
         let beta = 2.0 * amplitude.sqrt() * alpha;
-        let (numerator, denominator) = match shelf {
-            Shelf::Low => (
-                [
-                    amplitude * ((amplitude + 1.0) - (amplitude - 1.0) * cosine + beta),
-                    2.0 * amplitude * ((amplitude - 1.0) - (amplitude + 1.0) * cosine),
-                    amplitude * ((amplitude + 1.0) - (amplitude - 1.0) * cosine - beta),
-                ],
-                [
-                    (amplitude + 1.0) + (amplitude - 1.0) * cosine + beta,
-                    -2.0 * ((amplitude - 1.0) + (amplitude + 1.0) * cosine),
-                    (amplitude + 1.0) + (amplitude - 1.0) * cosine - beta,
-                ],
-            ),
-            Shelf::High => (
-                [
-                    amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cosine + beta),
-                    -2.0 * amplitude * ((amplitude - 1.0) + (amplitude + 1.0) * cosine),
-                    amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cosine - beta),
-                ],
-                [
-                    (amplitude + 1.0) - (amplitude - 1.0) * cosine + beta,
-                    2.0 * ((amplitude - 1.0) - (amplitude + 1.0) * cosine),
-                    (amplitude + 1.0) - (amplitude - 1.0) * cosine - beta,
-                ],
-            ),
-        };
+        let numerator = [
+            amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cosine + beta),
+            -2.0 * amplitude * ((amplitude - 1.0) + (amplitude + 1.0) * cosine),
+            amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cosine - beta),
+        ];
+        let denominator = [
+            (amplitude + 1.0) - (amplitude - 1.0) * cosine + beta,
+            2.0 * ((amplitude - 1.0) - (amplitude + 1.0) * cosine),
+            (amplitude + 1.0) - (amplitude - 1.0) * cosine - beta,
+        ];
         Self::normalized(numerator, denominator)
     }
 
@@ -215,13 +181,25 @@ mod tests {
 
     #[test]
     fn finishing_curve_remains_subtle() {
-        for (frequency, expected_db) in [(20.0, 0.8), (240.0, -0.8), (16_000.0, 0.5)] {
+        for (frequency, expected_db) in [(55.0, 0.8), (240.0, -0.8), (16_000.0, 0.5)] {
             let measured = measure_gain(frequency);
             assert!(
                 (measured - expected_db).abs() < 0.15,
                 "{frequency} Hz gain was {measured:.3} dB; expected {expected_db:.3} dB"
             );
         }
+    }
+
+    #[test]
+    fn bass_contour_is_a_broad_peak_instead_of_a_shelf() {
+        let low_edge = measure_gain(20.0);
+        let center = measure_gain(55.0);
+        let high_edge = measure_gain(80.0);
+
+        assert!(low_edge > 0.05, "20 Hz gain was {low_edge:.3} dB");
+        assert!(high_edge > 0.05, "80 Hz gain was {high_edge:.3} dB");
+        assert!(center > low_edge + 0.2);
+        assert!(center > high_edge + 0.2);
     }
 
     #[test]

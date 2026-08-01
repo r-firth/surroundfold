@@ -64,8 +64,37 @@ profile's dark or reverberant character. Concatenated stereo WAV profiles
 remain supported with 1 through 16 virtual positions and receive the same
 one-time high-quality impulse resampling.
 
+For object-capable tracks, `--object-renderer continuous` replaces
+virtual-speaker blending for point objects with one time-aligned binaural
+filter per object. Analytic ILD and the common-ear directional spectral shape
+are synthesized from separate targets into a short minimum-phase body on a
+5-by-10-degree spherical grid, while ITD is applied as a separate smoothly
+varying 24-tap bandlimited fractional delay. The delay follows rigid-sphere
+Woodworth path geometry instead of scaling the ear maximum as a sine, avoiding
+exaggerated ITD at intermediate lateral angles. Both interaural cues use the
+physical 3-D interaural-axis projection, so they weaken continuously toward
+the elevation poles. Unconstrained point objects feed their authored 3-D
+direction directly to this path, preserving height even when the selected
+virtual-speaker profile has only ground-plane routes. Explicit snap and zone
+constraints retain their metadata-defined route bearing. This prevents
+intermediate positions from mixing several already-delayed HRIRs, flattening
+height through a coplanar route array, or losing upper-spectrum energy to
+short delay interpolation. Speaker-anchored and deliberately extended objects
+retain the established route renderer.
+
+`--distance-renderer image-source` independently replaces the fixed early
+field. It uses constant-power direct/early scaling and six first-order image
+reflections whose path-excess delay, arrival direction, surface loss, and
+high-frequency absorption follow each source. Reflection timing uses the same
+bandlimited fractional delay as moving ITD. The model has no late-reverb stage
+and keeps every reflection arrival inside 80 milliseconds; filter decay is
+scaled with sample rate so high-rate renders are not truncated above the
+24-bit floor. Both new architectures are opt-in while listening evaluation is
+in progress.
+
 The single appended track receives a fixed common-left/right finishing curve:
-+0.8 dB at 60 Hz, -0.8 dB around 240 Hz, and a +0.5 dB high shelf from 8 kHz.
++0.8 dB from a broad bell centred at 55 Hz, -0.8 dB around 240 Hz, and a
++0.5 dB high shelf from 8 kHz.
 The renderer applies it before linked true-peak control and final 24-bit
 quantization, so the delivery encode cannot introduce another rounding pass.
 It adds no compression, loudness normalization, or channel-dependent
@@ -79,10 +108,14 @@ processing.
 | `--gain-db NUMBER` | `-5.5` | Gain before the output limiter |
 | `--surround-swap on\|off` | `off` | Exchange side and rear surround routes |
 | `--speaker-virtualizer on\|off` | `off` | Direct stereo fold-down for ground beds, bypassing their HRIRs |
+| `--object-renderer baseline\|continuous` | `baseline` | Approved route renderer or continuous point-object filters |
+| `--distance-renderer baseline\|image-source` | `baseline` | Fixed early field or source-relative first-order reflections |
 | `--mute-bed on\|off` | `off` | Mute reference bed sources |
 | `--mute-ground on\|off` | `off` | Mute ground-plane sources |
 | `--room-correction PATH` | off | Apply a stereo room-correction FIR after binaural rendering |
 | `--output-codec flac\|aac` | `flac` | Lossless 24-bit delivery, or fast 320 kb/s AAC-LC compatibility output |
+| `--track-title TITLE` | `SurroundFold binaural` | Override the appended track's Matroska title |
+| `--keep-existing-surroundfold` | off | Preserve tracks appended by earlier SurroundFold runs |
 | `--matrix on\|off` | `off` | Expand channel audio before height generation |
 | `--upconvert on\|off` | `off` | Generate height content from channel audio |
 | `--effect 0..100` | `75` | Height-generation strength |
@@ -154,11 +187,11 @@ latency is removed so the appended track remains aligned with the source.
 TrueHD and DD+/Atmos beds and objects share calibrated binaural LFE routing,
 parametric ITD/ILD panning with bounded measured direction shapes,
 metadata-space movement interpolation, and linked 4×-oversampled true-peak
-control. Authored OAMD distance is retained separately from direction and
-controls a sparse directional early field. Four arrivals
-between roughly 7 and 34 milliseconds add externalization and distance cues
-without attenuating or delaying the authored direct signal; no late reverb is
-added.
+control. The approved distance renderer retains authored OAMD distance
+separately from direction and feeds four fixed arrivals between roughly 7 and
+34 milliseconds. The opt-in image-source renderer instead uses the authored
+distance to balance direct and early energy while moving six first-order
+arrivals with the object. Neither path adds late reverb.
 
 ## Test and quality gates
 
@@ -167,6 +200,13 @@ cargo fmt --all -- --check
 cargo clippy -p surroundfold --all-targets --no-deps -- -D warnings
 cargo test --workspace --all-targets
 cargo test --workspace --all-targets --no-default-features
+```
+
+Repeat the four-way renderer wall-clock regression on a representative object
+track with:
+
+```bash
+scripts/benchmark-renderers.sh /path/to/object-audio.mkv
 ```
 
 Generated integration tests exercise channel rendering, TrueHD decoding when
@@ -211,7 +251,9 @@ license policy, and RustSec advisory checks on Apple Silicon and Intel macOS.
   downmix configurations defined there.
 - The bundled 7.1 profile has no measured overhead responses. Supply a measured
   SOFA profile for genuine individualized elevation cues.
-- SOFA object rendering uses an artifact-free 66-direction virtual array rather
-  than swapping a time-varying convolution filter at every metadata update.
+- The default SOFA object renderer uses its established 66-direction virtual
+  array. The experimental continuous renderer bypasses that array for point
+  objects and preserves their authored elevation independently of the array;
+  speaker-anchored and deliberately extended objects still use it.
 - Live playback and hardware bitstream output are outside this offline
   stereo-renderer's scope.

@@ -33,6 +33,24 @@ pub enum OutputCodec {
     Aac,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ObjectRendererMode {
+    /// Approved virtual-speaker renderer.
+    #[default]
+    Baseline,
+    /// Continuous object filters and source-relative early reflections.
+    Continuous,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum DistanceRendererMode {
+    /// Approved fixed sparse early field.
+    #[default]
+    Baseline,
+    /// Constant-power direct sound plus source-relative image reflections.
+    ImageSource,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "surroundfold",
@@ -93,6 +111,14 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t)]
     pub speaker_virtualizer: Toggle,
 
+    /// Object spatialization architecture.
+    #[arg(long, value_enum, default_value_t)]
+    pub object_renderer: ObjectRendererMode,
+
+    /// Authored-distance and early-reflection architecture.
+    #[arg(long, value_enum, default_value_t)]
+    pub distance_renderer: DistanceRendererMode,
+
     /// Mute reference bed-position sources.
     #[arg(long, value_enum, default_value_t)]
     pub mute_bed: Toggle,
@@ -108,6 +134,14 @@ pub struct Cli {
     /// Appended-track codec; FLAC is lossless, AAC maximizes device compatibility.
     #[arg(long, value_enum, default_value_t)]
     pub output_codec: OutputCodec,
+
+    /// Override the appended audio track's Matroska title.
+    #[arg(long, value_name = "TITLE")]
+    pub track_title: Option<String>,
+
+    /// Preserve audio tracks created by earlier `SurroundFold` runs.
+    #[arg(long)]
+    pub keep_existing_surroundfold: bool,
 
     /// MLP/TrueHD presentation index.
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3))]
@@ -152,12 +186,33 @@ pub struct Cli {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, OutputCodec};
+    use super::{Cli, DistanceRendererMode, ObjectRendererMode, OutputCodec};
 
     #[test]
     fn playback_calibrated_gain_is_the_default() {
         let cli = Cli::try_parse_from(["surroundfold", "input.mkv"]).unwrap();
         assert!((cli.gain_db + 5.5).abs() < f64::EPSILON);
         assert_eq!(cli.output_codec, OutputCodec::Flac);
+        assert_eq!(cli.object_renderer, ObjectRendererMode::Baseline);
+        assert_eq!(cli.distance_renderer, DistanceRendererMode::Baseline);
+        assert_eq!(cli.track_title, None);
+        assert!(!cli.keep_existing_surroundfold);
+    }
+
+    #[test]
+    fn custom_title_and_existing_track_retention_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "surroundfold",
+            "input.mkv",
+            "--track-title",
+            "SurroundFold 04 - Continuous + Image Distance",
+            "--keep-existing-surroundfold",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.track_title.as_deref(),
+            Some("SurroundFold 04 - Continuous + Image Distance")
+        );
+        assert!(cli.keep_existing_surroundfold);
     }
 }

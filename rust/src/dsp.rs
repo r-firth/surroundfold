@@ -148,6 +148,8 @@ impl StereoConvolver {
         }
         self.history_head = (self.history_head + 1) % self.history.len();
 
+        prepare_real_inverse_spectrum(&mut self.spectrum_left)?;
+        prepare_real_inverse_spectrum(&mut self.spectrum_right)?;
         self.inverse
             .process_with_scratch(
                 &mut self.spectrum_left,
@@ -323,6 +325,8 @@ impl StereoConvolverBank {
             bus.history_head = (bus.history_head + 1) % bus.history.len();
         }
 
+        prepare_real_inverse_spectrum(&mut self.spectrum_left)?;
+        prepare_real_inverse_spectrum(&mut self.spectrum_right)?;
         self.inverse
             .process_with_scratch(
                 &mut self.spectrum_left,
@@ -347,6 +351,26 @@ impl StereoConvolverBank {
         }
         Ok(())
     }
+}
+
+fn prepare_real_inverse_spectrum(spectrum: &mut [Complex32]) -> Result<(), AppError> {
+    let last = spectrum.len().checked_sub(1).ok_or_else(|| {
+        AppError::Render("real inverse FFT received an empty frequency spectrum".into())
+    })?;
+    for index in [0, last] {
+        let endpoint = &mut spectrum[index];
+        if !endpoint.re.is_finite() || !endpoint.im.is_finite() {
+            return Err(AppError::Render(
+                "real inverse FFT spectrum has a non-finite endpoint".into(),
+            ));
+        }
+        // DC and Nyquist are their own conjugates and therefore have no
+        // imaginary component. Long accumulations can leave a rounding
+        // residue here on some FFT backends, so restore the exact invariant
+        // required by the real inverse transform.
+        endpoint.im = 0.0;
+    }
+    Ok(())
 }
 
 fn partition_impulse(
@@ -679,6 +703,31 @@ mod tests {
 
         assert_samples(&bank_left, &expected_left);
         assert_samples(&bank_right, &expected_right);
+    }
+
+    #[test]
+    fn inverse_fft_accepts_rounding_residue_at_real_spectrum_endpoints() {
+        let filters = [(vec![1.0], vec![0.5])];
+        let mut bank = StereoConvolverBank::new(
+            filters
+                .iter()
+                .map(|(left, right)| (left.as_slice(), right.as_slice())),
+            4,
+        )
+        .unwrap();
+        let last = bank.buses[0].filters_left[0].len() - 1;
+        let bus = &mut bank.buses[0];
+        for spectrum in [&mut bus.filters_left[0], &mut bus.filters_right[0]] {
+            spectrum[0].im = f32::EPSILON;
+            spectrum[last].im = -f32::EPSILON;
+        }
+
+        let mut left = [0.0; 4];
+        let mut right = [0.0; 4];
+        bank.process(&[vec![1.0, 0.0, 0.0, 0.0]], &[true], &mut left, &mut right)
+            .unwrap();
+        assert_samples(&left, &[1.0, 0.0, 0.0, 0.0]);
+        assert_samples(&right, &[0.5, 0.0, 0.0, 0.0]);
     }
 
     #[test]

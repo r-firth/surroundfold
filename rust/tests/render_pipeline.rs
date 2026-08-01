@@ -138,6 +138,61 @@ fn default_operation_replaces_input_and_appends_one_finished_track() {
 }
 
 #[test]
+fn explicit_retention_preserves_previous_track_and_appends_custom_title() {
+    const CUSTOM_TITLE: &str = "SurroundFold 04 - Continuous + Image Distance";
+
+    let runner = ProcessRunner::new(Cancellation::new());
+    let Ok(ffmpeg) = runner.locate_required("ffmpeg", None) else {
+        eprintln!("skipping in-place retention test because ffmpeg is unavailable");
+        return;
+    };
+    let Ok(ffprobe) = runner.locate_required("ffprobe", None) else {
+        eprintln!("skipping in-place retention test because ffprobe is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("source.mkv");
+    generate_input(&runner, &ffmpeg, &input);
+
+    let first = Cli::try_parse_from([
+        OsString::from("surroundfold"),
+        input.as_os_str().to_os_string(),
+        OsString::from("--progress"),
+        OsString::from("quiet"),
+    ])
+    .unwrap();
+    surroundfold::run(&first, &Cancellation::new()).unwrap();
+
+    let second = Cli::try_parse_from([
+        OsString::from("surroundfold"),
+        input.as_os_str().to_os_string(),
+        OsString::from("--track"),
+        OsString::from("0"),
+        OsString::from("--track-title"),
+        OsString::from(CUSTOM_TITLE),
+        OsString::from("--keep-existing-surroundfold"),
+        OsString::from("--progress"),
+        OsString::from("quiet"),
+    ])
+    .unwrap();
+    surroundfold::run(&second, &Cancellation::new()).unwrap();
+
+    let manifest = MediaProbe::new(&runner, ffprobe).probe(&input).unwrap();
+    assert_eq!(manifest.streams.len(), 3);
+    for title in [BINAURAL_TITLE, CUSTOM_TITLE] {
+        let track = manifest
+            .streams
+            .iter()
+            .find(|stream| stream.tag("title") == Some(title))
+            .unwrap();
+        assert_eq!(track.codec_name, "flac");
+        assert_eq!(track.bits_per_raw_sample, Some(24));
+        assert_eq!(track.channels, Some(2));
+        assert_eq!(track.disposition.get("default"), Some(&0));
+    }
+}
+
+#[test]
 fn matrix_and_height_controls_run_through_the_native_pipeline() {
     let runner = ProcessRunner::new(Cancellation::new());
     let Ok(ffmpeg) = runner.locate_required("ffmpeg", None) else {

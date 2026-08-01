@@ -118,6 +118,38 @@ impl SpatialPanner {
         gains
     }
 
+    #[must_use]
+    pub(crate) fn resultant_direction(&self, gains: &[f32], fallback: [f32; 3]) -> [f32; 3] {
+        let mut result = [0.0; 3];
+        for bus in &self.buses {
+            // VBAP coefficients reconstruct the source vector linearly. An
+            // energy centroid (squared coefficients) is appropriate for
+            // incoherent loudspeakers, but it bends the direction when those
+            // routes are collapsed back to one coherent continuous HRTF.
+            let weight = gains.get(bus.index).copied().unwrap_or(0.0);
+            for (axis, direction) in result.iter_mut().zip(bus.direction) {
+                *axis += direction * weight;
+            }
+        }
+        let length = result.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if length > f32::EPSILON {
+            result.map(|value| value / length)
+        } else {
+            normalized(fallback)
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn untrimmed_point_gains(&self, direction: [f32; 3], gain: f32) -> Vec<f32> {
+        let permitted = self.buses.iter().collect::<Vec<_>>();
+        let mut gains = point_gains(direction, &permitted, self.output_bus_count);
+        normalize_power(&mut gains);
+        for output_gain in &mut gains {
+            *output_gain *= gain;
+        }
+        gains
+    }
+
     /// Pans one source position to the available virtual speakers.
     ///
     /// A non-zero `size` integrates point pans over the signalled rectangular
@@ -812,8 +844,9 @@ fn normalize_power(gains: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PanningBus, SpatialPanner, bus_permitted, containing_triplet, direct_stereo_gains,
-        is_height, is_mid, normalize_power, normalized, snapped_position, triplet_vbap,
+        PanningBus, SpatialPanner, bus_permitted, containing_triplet, direct_stereo_gains, dot,
+        is_height, is_mid, normalize_power, normalized, point_gains, snapped_position,
+        triplet_vbap,
     };
     use crate::{
         binaural::BinauralWriter,
@@ -862,6 +895,42 @@ mod tests {
                 "local VBAP differed from exhaustive search by {maximum_difference}"
             );
         }
+    }
+
+    #[test]
+    fn continuous_resultant_does_not_inherit_route_lattice_error() {
+        let directions = fibonacci_sphere(66);
+        let buses = directions
+            .into_iter()
+            .enumerate()
+            .map(|(index, direction)| PanningBus {
+                index,
+                speaker: Speaker::FrontCenter,
+                direction,
+                named: false,
+            })
+            .collect::<Vec<_>>();
+        let panner = SpatialPanner {
+            output_bus_count: buses.len(),
+            buses,
+            lfe_bus: None,
+            stereo_trim_configuration: false,
+        };
+        let bus_refs = panner.buses.iter().collect::<Vec<_>>();
+        let mut maximum_error = 0.0_f32;
+        for direction in fibonacci_sphere(4_096) {
+            let gains = point_gains(direction, &bus_refs, panner.output_bus_count);
+            let rendered = panner.resultant_direction(&gains, direction);
+            let error = dot(direction, rendered)
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            maximum_error = maximum_error.max(error);
+        }
+        assert!(
+            maximum_error < 0.1,
+            "continuous direction inherited {maximum_error:.3}° of route-lattice error"
+        );
     }
 
     #[test]

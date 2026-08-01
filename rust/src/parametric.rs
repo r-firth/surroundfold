@@ -3,109 +3,217 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 use crate::binaural::PanningRoute;
 
 const DIRECTION_SHAPE_LIMIT_DB: f32 = 2.5;
-const MAXIMUM_ITD_SECONDS: f32 = 0.000_65;
+pub(crate) const MAXIMUM_ITD_SECONDS: f32 = 0.000_65;
+
+pub(crate) struct ParametricHrtfModel {
+    sample_rate: u32,
+    fft_len: usize,
+    output_len: usize,
+    common_delay: usize,
+    directions: Vec<[f32; 3]>,
+    direction_shapes: Vec<Vec<f32>>,
+}
+
+impl ParametricHrtfModel {
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn new(
+        measured: &[(Vec<f32>, Vec<f32>)],
+        routes: &[PanningRoute],
+        sample_rate: u32,
+    ) -> Option<Self> {
+        if routes.is_empty() {
+            return None;
+        }
+        let maximum_length = routes
+            .iter()
+            .map(|route| {
+                measured[route.index]
+                    .0
+                    .len()
+                    .max(measured[route.index].1.len())
+            })
+            .max()
+            .unwrap_or(256);
+        let fft_len = maximum_length
+            .saturating_mul(4)
+            .next_power_of_two()
+            .max(2_048);
+        let output_len = maximum_length.clamp(256, 512);
+        let bins = fft_len / 2 + 1;
+        let mut planner = FftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(fft_len);
+        let spectra = routes
+            .iter()
+            .map(|route| {
+                let (left, right) = &measured[route.index];
+                (
+                    magnitude_spectrum(left, fft_len, forward.as_ref()),
+                    magnitude_spectrum(right, fft_len, forward.as_ref()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut common_reference = vec![0.0; bins];
+        for (left, right) in &spectra {
+            for bin in 0..bins {
+                common_reference[bin] +=
+                    0.5 * (left[bin].max(1e-9).ln() + right[bin].max(1e-9).ln());
+            }
+        }
+        for value in &mut common_reference {
+            *value /= spectra.len() as f32;
+        }
+        let direction_shapes = spectra
+            .iter()
+            .map(|(left, right)| {
+                direction_shape(left, right, &common_reference, sample_rate, fft_len)
+            })
+            .collect();
+        Some(Self {
+            sample_rate,
+            fft_len,
+            output_len,
+            common_delay: profile_delay(measured, routes),
+            directions: routes.iter().map(|route| route.direction).collect(),
+            direction_shapes,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    #[must_use]
+    pub(crate) const fn common_delay(&self) -> usize {
+        self.common_delay
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn magnitudes(&self, direction: [f32; 3], fft_len: usize) -> (Vec<f32>, Vec<f32>) {
+        let lateral = interaural_axis_projection(direction);
+        let (mut left, mut right) = geometric_magnitude(lateral, self.sample_rate, fft_len);
+        for bin in 0..left.len() {
+            let frequency = bin as f32 * self.sample_rate as f32 / fft_len as f32;
+            let multiplier = self.interpolated_shape(direction, frequency).exp();
+            left[bin] *= multiplier;
+            right[bin] *= multiplier;
+        }
+        (left, right)
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn interpolated_shape(&self, direction: [f32; 3], frequency: f32) -> f32 {
+        let direction = normalized(direction);
+        let position = frequency * self.fft_len as f32 / self.sample_rate as f32;
+        let lower = position.floor().max(0.0) as usize;
+        let upper = lower
+            .saturating_add(1)
+            .min(self.direction_shapes[0].len() - 1);
+        let fraction = (position - lower as f32).clamp(0.0, 1.0);
+        let mut weighted = 0.0;
+        let mut weight_sum = 0.0;
+        for (route_direction, shape) in self.directions.iter().zip(&self.direction_shapes) {
+            let dot = direction_dot(direction, normalized(*route_direction)).clamp(-1.0, 1.0);
+            let angular_distance = 1.0 - dot;
+            let weight = 1.0 / (0.002 + angular_distance).powi(2);
+            let value = shape[lower].mul_add(1.0 - fraction, shape[upper] * fraction);
+            weighted += value * weight;
+            weight_sum += weight;
+        }
+        weighted / weight_sum.max(f32::EPSILON)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn apply(&self, filters: &mut [(Vec<f32>, Vec<f32>)], routes: &[PanningRoute]) {
+        let mut planner = FftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(self.fft_len);
+        let inverse = planner.plan_fft_inverse(self.fft_len);
+        for (route_position, route) in routes.iter().enumerate() {
+            // Preserve the approved virtual-speaker baseline. The continuous
+            // renderer uses the physically smooth 3-D interaural projection,
+            // but changing these established route filters would also change
+            // the default renderer before listening approval.
+            let lateral = baseline_horizontal_lateral_position(route.direction);
+            let (mut left_magnitude, mut right_magnitude) =
+                geometric_magnitude(lateral, self.sample_rate, self.fft_len);
+            for bin in 0..left_magnitude.len() {
+                let multiplier = self.direction_shapes[route_position][bin].exp();
+                left_magnitude[bin] *= multiplier;
+                right_magnitude[bin] *= multiplier;
+            }
+            let left = minimum_phase_impulse(
+                &left_magnitude,
+                self.fft_len,
+                self.output_len,
+                forward.as_ref(),
+                inverse.as_ref(),
+            );
+            let right = minimum_phase_impulse(
+                &right_magnitude,
+                self.fft_len,
+                self.output_len,
+                forward.as_ref(),
+                inverse.as_ref(),
+            );
+            let itd = lateral * MAXIMUM_ITD_SECONDS * self.sample_rate as f32;
+            filters[route.index] = (
+                delayed_impulse(&left, self.common_delay as f32 + itd.max(0.0)),
+                delayed_impulse(&right, self.common_delay as f32 + (-itd).max(0.0)),
+            );
+        }
+    }
+}
 
 /// Replaces profile-wide HRIR colour with a clean analytic ITD/ILD body while
 /// retaining a small, regularised portion of each measured direction's upper
 /// spectral shape. The same direction-shape gain is applied to both ears, so
 /// it cannot alter the analytic interaural level difference.
-#[allow(clippy::cast_precision_loss)]
 pub(crate) fn apply_direction_shaped_parametric_hrtf(
     filters: &mut [(Vec<f32>, Vec<f32>)],
     routes: &[PanningRoute],
     sample_rate: u32,
-) {
-    if routes.is_empty() {
-        return;
-    }
-
+) -> Option<ParametricHrtfModel> {
     let measured = filters.to_vec();
-    let maximum_length = routes
-        .iter()
-        .map(|route| {
-            measured[route.index]
-                .0
-                .len()
-                .max(measured[route.index].1.len())
-        })
-        .max()
-        .unwrap_or(256);
-    let fft_len = maximum_length
-        .saturating_mul(4)
-        .next_power_of_two()
-        .max(2_048);
-    let output_len = maximum_length.clamp(256, 512);
-    let bins = fft_len / 2 + 1;
-    let mut planner = FftPlanner::<f32>::new();
-    let forward = planner.plan_fft_forward(fft_len);
-    let inverse = planner.plan_fft_inverse(fft_len);
-    let spectra = routes
-        .iter()
-        .map(|route| {
-            let (left, right) = &measured[route.index];
-            (
-                magnitude_spectrum(left, fft_len, forward.as_ref()),
-                magnitude_spectrum(right, fft_len, forward.as_ref()),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut common_reference = vec![0.0; bins];
-    for (left, right) in &spectra {
-        for bin in 0..bins {
-            common_reference[bin] += 0.5 * (left[bin].max(1e-9).ln() + right[bin].max(1e-9).ln());
-        }
-    }
-    for value in &mut common_reference {
-        *value /= spectra.len() as f32;
-    }
-    let common_delay = profile_delay(&measured, routes);
-
-    for (route_position, route) in routes.iter().enumerate() {
-        let lateral = lateral_position(route.direction);
-        let (mut left_magnitude, mut right_magnitude) =
-            geometric_magnitude(lateral, sample_rate, fft_len);
-        let shape = direction_shape(
-            &spectra[route_position].0,
-            &spectra[route_position].1,
-            &common_reference,
-            sample_rate,
-            fft_len,
-        );
-        for bin in 0..bins {
-            let multiplier = shape[bin].exp();
-            left_magnitude[bin] *= multiplier;
-            right_magnitude[bin] *= multiplier;
-        }
-
-        let left = minimum_phase_impulse(
-            &left_magnitude,
-            fft_len,
-            output_len,
-            forward.as_ref(),
-            inverse.as_ref(),
-        );
-        let right = minimum_phase_impulse(
-            &right_magnitude,
-            fft_len,
-            output_len,
-            forward.as_ref(),
-            inverse.as_ref(),
-        );
-        let itd = lateral * MAXIMUM_ITD_SECONDS * sample_rate as f32;
-        filters[route.index] = (
-            delayed_impulse(&left, common_delay as f32 + itd.max(0.0)),
-            delayed_impulse(&right, common_delay as f32 + (-itd).max(0.0)),
-        );
-    }
+    let model = ParametricHrtfModel::new(&measured, routes, sample_rate)?;
+    model.apply(filters, routes);
+    Some(model)
 }
 
-fn lateral_position(direction: [f32; 3]) -> f32 {
+fn baseline_horizontal_lateral_position(direction: [f32; 3]) -> f32 {
     let horizontal = direction[0].hypot(direction[1]);
     if horizontal > f32::EPSILON {
         (direction[0] / horizontal).clamp(-1.0, 1.0)
     } else {
         0.0
     }
+}
+
+fn interaural_axis_projection(direction: [f32; 3]) -> f32 {
+    normalized(direction)[0].clamp(-1.0, 1.0)
+}
+
+fn normalized(direction: [f32; 3]) -> [f32; 3] {
+    let length = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if length > f32::EPSILON {
+        direction.map(|value| value / length)
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+fn direction_dot(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left.into_iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -226,7 +334,7 @@ fn fractional_octave_smooth(values: &[f32]) -> Vec<f32> {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn minimum_phase_impulse(
+pub(crate) fn minimum_phase_impulse(
     magnitude: &[f32],
     fft_len: usize,
     output_len: usize,
@@ -303,7 +411,9 @@ fn peak_index(samples: &[f32]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIRECTION_SHAPE_LIMIT_DB, direction_shape, geometric_magnitude};
+    use super::{
+        DIRECTION_SHAPE_LIMIT_DB, direction_shape, geometric_magnitude, interaural_axis_projection,
+    };
 
     #[test]
     fn geometric_ild_is_symmetric_and_energy_normalized() {
@@ -314,6 +424,17 @@ mod tests {
             assert!((right[bin] - mirrored_left[bin]).abs() < 1e-6);
             assert!((left[bin].hypot(right[bin]) - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn continuous_lateral_cues_fade_smoothly_toward_the_elevation_poles() {
+        let horizontal = interaural_axis_projection([1.0, 0.0, 0.0]);
+        let elevated = interaural_axis_projection([1.0, 0.0, 1.0]);
+        let pole = interaural_axis_projection([0.0, 0.0, 1.0]);
+
+        assert!((horizontal - 1.0).abs() < f32::EPSILON);
+        assert!((elevated - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!(pole.abs() < f32::EPSILON);
     }
 
     #[test]

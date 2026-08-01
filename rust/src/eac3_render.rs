@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     binaural::BinauralWriter,
+    cli::{DistanceRendererMode, ObjectRendererMode},
     eac3::{Eac3Frame, FrameReader, MetadataPayload, StreamType, SyncFrameHeader},
     error::AppError,
     hrir::{HrirSet, Speaker},
@@ -31,6 +32,8 @@ pub struct Eac3RenderOptions {
     pub mute_bed: bool,
     pub mute_ground: bool,
     pub speaker_virtualizer: bool,
+    pub object_renderer: ObjectRendererMode,
+    pub distance_renderer: DistanceRendererMode,
 }
 
 /// Demuxes E-AC-3, lets `FFmpeg` decode only its channel core, reconstructs JOC
@@ -109,6 +112,8 @@ pub fn render_eac3_track(
             mute_bed: options.mute_bed,
             mute_ground: options.mute_ground,
             speaker_virtualizer: options.speaker_virtualizer,
+            object_renderer: options.object_renderer,
+            distance_renderer: options.distance_renderer,
         },
     )?;
     let mut pipeline = Eac3ObjectPipeline {

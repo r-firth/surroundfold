@@ -1,6 +1,7 @@
 pub mod binaural;
 pub mod cancel;
 pub mod cli;
+mod continuous;
 pub mod dsp;
 pub mod eac3;
 pub mod eac3_render;
@@ -39,7 +40,7 @@ use std::{
 };
 
 use cancel::Cancellation;
-use cli::{Cli, ProgressMode, Toggle};
+use cli::{Cli, DistanceRendererMode, ObjectRendererMode, ProgressMode, Toggle};
 use eac3_render::{Eac3RenderOptions, render_eac3_track};
 use error::AppError;
 use hrir::HrirSet;
@@ -169,6 +170,8 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
                         mute_bed: cli.mute_bed.enabled(),
                         mute_ground: cli.mute_ground.enabled(),
                         speaker_virtualizer: cli.speaker_virtualizer.enabled(),
+                        object_renderer: cli.object_renderer,
+                        distance_renderer: cli.distance_renderer,
                     },
                     &rendered,
                 )?
@@ -196,6 +199,8 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
                     mute_bed: cli.mute_bed.enabled(),
                     mute_ground: cli.mute_ground.enabled(),
                     speaker_virtualizer: cli.speaker_virtualizer.enabled(),
+                    object_renderer: cli.object_renderer,
+                    distance_renderer: cli.distance_renderer,
                 },
                 &elementary,
                 &decoded,
@@ -215,16 +220,21 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
     );
 
     let encode_mux_started = Instant::now();
+    let track_title = cli.track_title.as_deref().unwrap_or(BINAURAL_TITLE);
     let appended_tracks = [AppendedTrack {
         path: &rendered,
-        title: BINAURAL_TITLE,
+        title: track_title,
         codec: cli.output_codec,
         sample_rate: render.sample_rate,
         frames: render.frames,
     }];
 
     let selected_start = selected_stream.start_time.unwrap_or(0.0);
-    let replacement_source = source_without_previous_outputs(&manifest);
+    let replacement_source = if cli.keep_existing_surroundfold {
+        manifest.clone()
+    } else {
+        source_without_previous_outputs(&manifest)
+    };
     let replacement_selected_stream = replacement_source
         .streams
         .iter()
@@ -332,6 +342,17 @@ fn validate_implemented_options(cli: &Cli, capability: DecodeCapability) -> Resu
                 .into_iter()
                 .filter_map(|(enabled, name)| enabled.then_some(name)),
         );
+    }
+    if capability == DecodeCapability::Channels
+        && (cli.object_renderer != ObjectRendererMode::Baseline
+            || cli.distance_renderer != DistanceRendererMode::Baseline)
+    {
+        if cli.object_renderer != ObjectRendererMode::Baseline {
+            unsupported.push("--object-renderer");
+        }
+        if cli.distance_renderer != DistanceRendererMode::Baseline {
+            unsupported.push("--distance-renderer");
+        }
     }
     if unsupported.is_empty() {
         Ok(())

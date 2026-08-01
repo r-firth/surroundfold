@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     binaural::BinauralWriter,
+    cli::{DistanceRendererMode, ObjectRendererMode},
     error::AppError,
     hrir::HrirSet,
     object_render::{ObjectPcmFrame, ObjectRenderOptions, ObjectRenderer},
@@ -27,6 +28,8 @@ pub struct TrueHdRenderOptions {
     pub mute_bed: bool,
     pub mute_ground: bool,
     pub speaker_virtualizer: bool,
+    pub object_renderer: ObjectRendererMode,
+    pub distance_renderer: DistanceRendererMode,
 }
 
 /// Demuxes a selected `TrueHD` stream, decodes it in-process, and renders beds
@@ -62,6 +65,8 @@ pub fn render_truehd_track(
             mute_bed: options.mute_bed,
             mute_ground: options.mute_ground,
             speaker_virtualizer: options.speaker_virtualizer,
+            object_renderer: options.object_renderer,
+            distance_renderer: options.distance_renderer,
         },
     )?;
     let arguments = [
