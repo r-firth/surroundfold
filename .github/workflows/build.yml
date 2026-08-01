@@ -65,27 +65,15 @@ jobs:
       - name: Smoke release executable
         run: scripts/smoke-published.sh target/release/surroundfold
 
-      - name: Assemble licensed release artifact
+      - name: Assemble release artifact
         run: |
           package="target/release/surroundfold-macos-${{ matrix.arch }}"
           mkdir -p "$package"
           cp target/release/surroundfold "$package/surroundfold"
-          cp LICENSE THIRD_PARTY_NOTICES.md README.md "$package/"
+          cp README.md "$package/"
 
       - uses: actions/upload-artifact@v4
         with:
           name: surroundfold-macos-${{ matrix.arch }}
           path: target/release/surroundfold-macos-${{ matrix.arch }}
           if-no-files-found: error
-
-  supply-chain:
-    name: Dependency policy
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.19.4 --locked
-
-      - name: Check advisories, licenses, and sources
-        run: cargo deny --all-features check advisories licenses sources

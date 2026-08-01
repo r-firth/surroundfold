@@ -472,7 +472,15 @@ fn verify_appended_track(
         .ok_or_else(|| AppError::Mux("ffprobe did not report appended start time".into()))?;
     let encoder_padding =
         f64::from(appended.initial_padding.unwrap_or(0)) / f64::from(expected.sample_rate);
-    let presentation_start = actual_start + encoder_padding;
+    // FFprobe 8.0 reports AAC start_time before encoder priming, while 8.1
+    // reports the effective presentation start. Normalize either convention.
+    let presentation_start = if (actual_start - synchronized_start).abs()
+        <= (actual_start + encoder_padding - synchronized_start).abs()
+    {
+        actual_start
+    } else {
+        actual_start + encoder_padding
+    };
     if (presentation_start - synchronized_start).abs() > timestamp_tolerance {
         return Err(AppError::Mux(format!(
             "appended '{}' presentation starts at {presentation_start}s; selected stream starts at {synchronized_start}s",
@@ -994,10 +1002,15 @@ mod tests {
         output.streams.push(appended);
         verify_output(&source, &output, &source.streams[1], &expected, 1.0).unwrap();
 
+        // FFmpeg 8.1 reports the effective start instead of the pre-priming
+        // packet timestamp used by earlier versions.
         output.streams[2].start_time = Some(1.0);
+        verify_output(&source, &output, &source.streams[1], &expected, 1.0).unwrap();
+
+        output.streams[2].start_time = Some(1.05);
         assert!(
             verify_output(&source, &output, &source.streams[1], &expected, 1.0).is_err(),
-            "AAC whose priming delays presentation start was accepted"
+            "AAC with a genuine start offset was accepted"
         );
     }
 
