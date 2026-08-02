@@ -355,8 +355,12 @@ fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
         .map(|pair| pair[0].position.abs_diff(pair[1].position))
         .max()
         .unwrap();
+    // At the fixture's fixed 8 Mb/s video rate, two seconds is roughly 2 MB.
+    // The former 512 KiB bound assumed sub-second Matroska clustering and was
+    // tighter than FFmpeg guarantees; the starvation regression placed audio
+    // packets hundreds of megabytes apart.
     assert!(
-        largest_gap < 512 * 1024,
+        largest_gap < 2 * 1024 * 1024,
         "appended FLAC has a {largest_gap}-byte physical packet gap"
     );
 }
