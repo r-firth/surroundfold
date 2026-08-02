@@ -1,10 +1,10 @@
 [package]
 name = "surroundfold"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.88"
 description = "Offline object- and channel-audio binaural renderer"
-repository = "https://github.com/ryanfirth/surroundfold"
+repository = "https://github.com/r-firth/surroundfold"
 license = "Apache-2.0"
 publish = false
 
@@ -32,6 +32,7 @@ sofar = { version = "0.3.0", default-features = false, features = ["resample"] }
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 truehd = { path = "vendor/truehd", optional = true }
+wide = "0.7.33"
 
 [lints.rust]
 unsafe_code = "deny"

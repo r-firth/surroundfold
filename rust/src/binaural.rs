@@ -84,14 +84,15 @@ struct ReflectionTap {
 }
 
 struct ReflectionSource {
+    input: f32,
     delay_line: Vec<f32>,
+    delay_capacity: usize,
     cursor: usize,
-    taps: Vec<ReflectionTap>,
+    taps: [ReflectionTap; EARLY_REFLECTIONS.len()],
     remaining: usize,
 }
 
 struct EarlyReflectionField {
-    inputs: Vec<f32>,
     sources: Vec<Option<ReflectionSource>>,
     active_sources: Vec<usize>,
     maximum_tail: usize,
@@ -99,14 +100,10 @@ struct EarlyReflectionField {
 
 impl EarlyReflectionField {
     fn new(sample_rate: u32, bus_count: usize, routes: &[PanningRoute]) -> Self {
-        let taps = EARLY_REFLECTIONS
-            .iter()
-            .map(|spec| {
-                let delay = reflection_delay_frames(spec, sample_rate);
-                (spec, delay.max(1))
-            })
-            .collect::<Vec<_>>();
-        let maximum_delay = taps.iter().map(|(_, delay)| *delay).max().unwrap_or(0);
+        let delays = EARLY_REFLECTIONS
+            .each_ref()
+            .map(|spec| reflection_delay_frames(spec, sample_rate).max(1));
+        let maximum_delay = delays.iter().copied().max().unwrap_or(0);
         // This lets the slowest one-pole response decay below the 24-bit
         // output noise floor after its final delayed sample.
         let filter_tail = usize::try_from(sample_rate.div_ceil(1_000)).unwrap_or(usize::MAX);
@@ -114,25 +111,26 @@ impl EarlyReflectionField {
         let delay_line_len = maximum_delay + 1;
         let mut sources = (0..bus_count).map(|_| None).collect::<Vec<_>>();
         for route in routes {
-            let source_taps = taps
-                .iter()
-                .map(|(spec, delay)| ReflectionTap {
+            let source_taps = std::array::from_fn(|index| {
+                let spec = &EARLY_REFLECTIONS[index];
+                ReflectionTap {
                     destination: closest_route(routes, reflected_direction(route.direction, spec)),
-                    delay: *delay,
+                    delay: delays[index],
                     gain: spec.gain,
                     low_pass_coefficient: one_pole_coefficient(spec.cutoff_hz, sample_rate),
                     filtered: 0.0,
-                })
-                .collect();
+                }
+            });
             sources[route.index] = Some(ReflectionSource {
-                delay_line: vec![0.0; delay_line_len],
+                input: 0.0,
+                delay_line: vec![0.0; delay_line_len * 2],
+                delay_capacity: delay_line_len,
                 cursor: 0,
                 taps: source_taps,
                 remaining: 0,
             });
         }
         Self {
-            inputs: vec![0.0; bus_count],
             sources,
             active_sources: Vec::new(),
             maximum_tail,
@@ -140,11 +138,11 @@ impl EarlyReflectionField {
     }
 
     fn add(&mut self, bus: usize, sample: f32) -> Result<(), AppError> {
-        let input = self.inputs.get_mut(bus).ok_or_else(|| {
+        let source = self.sources.get_mut(bus).ok_or_else(|| {
             AppError::Render(format!("early-reflection source bus {bus} does not exist"))
         })?;
-        if let Some(source) = self.sources[bus].as_mut() {
-            *input += sample;
+        if let Some(source) = source {
+            source.input += sample;
             if sample != 0.0 {
                 if source.remaining == 0 {
                     self.active_sources.push(bus);
@@ -156,32 +154,39 @@ impl EarlyReflectionField {
     }
 
     fn render_frame(&mut self, buses: &mut [Vec<f32>], bus_has_input: &mut [bool], frame: usize) {
-        let active_sources = std::mem::take(&mut self.active_sources);
-        for source_index in active_sources {
-            let input = std::mem::take(&mut self.inputs[source_index]);
+        let processing = self.active_sources.len();
+        let mut retained = 0;
+        for position in 0..processing {
+            let source_index = self.active_sources[position];
             let source = self.sources[source_index]
                 .as_mut()
                 .expect("active early-reflection source must exist");
+            let input = std::mem::take(&mut source.input);
             source.delay_line[source.cursor] = input;
+            source.delay_line[source.cursor + source.delay_capacity] = input;
             for tap in &mut source.taps {
-                let index =
-                    (source.cursor + source.delay_line.len() - tap.delay) % source.delay_line.len();
-                let delayed = source.delay_line[index];
+                let delayed = source.delay_line[source.cursor + tap.delay];
                 tap.filtered += tap.low_pass_coefficient * (delayed - tap.filtered);
                 let reflected = tap.filtered * tap.gain;
                 buses[tap.destination][frame] += reflected;
                 bus_has_input[tap.destination] |= reflected != 0.0;
             }
-            source.cursor = (source.cursor + 1) % source.delay_line.len();
+            source.cursor = if source.cursor == 0 {
+                source.delay_capacity - 1
+            } else {
+                source.cursor - 1
+            };
             source.remaining -= 1;
             if source.remaining == 0 {
                 for tap in &mut source.taps {
                     tap.filtered = 0.0;
                 }
             } else {
-                self.active_sources.push(source_index);
+                self.active_sources[retained] = source_index;
+                retained += 1;
             }
         }
+        self.active_sources.truncate(retained);
     }
 
     fn tail_frames(&self) -> usize {

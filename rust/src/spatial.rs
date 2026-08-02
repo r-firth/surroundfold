@@ -40,10 +40,12 @@ pub(crate) fn direct_stereo_gains(speaker: Speaker) -> [f32; 2] {
     }
 }
 
+#[derive(Clone, Copy)]
 struct PanningBus {
     index: usize,
     speaker: Speaker,
     direction: [f32; 3],
+    azimuth: f32,
     named: bool,
 }
 
@@ -80,12 +82,14 @@ impl SpatialPanner {
             .into_iter()
             .map(|route| {
                 let named = route.speaker.is_some();
+                let direction = normalized(route.direction);
                 PanningBus {
                     index: route.index,
                     speaker: route
                         .speaker
                         .unwrap_or_else(|| closest_reference_speaker(route.direction)),
-                    direction: normalized(route.direction),
+                    direction,
+                    azimuth: azimuth(direction),
                     named,
                 }
             })
@@ -141,8 +145,7 @@ impl SpatialPanner {
 
     #[must_use]
     pub(crate) fn untrimmed_point_gains(&self, direction: [f32; 3], gain: f32) -> Vec<f32> {
-        let permitted = self.buses.iter().collect::<Vec<_>>();
-        let mut gains = point_gains(direction, &permitted, self.output_bus_count);
+        let mut gains = point_gains(direction, &self.buses, self.output_bus_count);
         normalize_power(&mut gains);
         for output_gain in &mut gains {
             *output_gain *= gain;
@@ -191,21 +194,29 @@ impl SpatialPanner {
                     Speaker::RearLeft | Speaker::RearRight | Speaker::RearCenter
                 )
         });
-        let mut permitted = self
-            .buses
-            .iter()
-            .filter(|bus| panning_bus_permitted(bus, zone, elevation, has_rear))
-            .collect::<Vec<_>>();
-        if permitted.is_empty() {
-            permitted = self
-                .buses
-                .iter()
-                .filter(|bus| elevation || is_listener_plane(bus.direction))
-                .collect();
-        }
-        if permitted.is_empty() {
-            permitted = self.buses.iter().collect();
-        }
+        let mut filtered = Vec::new();
+        let permitted = if zone == ObjectZone::All && elevation {
+            self.buses.as_slice()
+        } else {
+            filtered.extend(
+                self.buses
+                    .iter()
+                    .filter(|bus| panning_bus_permitted(bus, zone, elevation, has_rear))
+                    .copied(),
+            );
+            if filtered.is_empty() {
+                filtered.extend(
+                    self.buses
+                        .iter()
+                        .filter(|bus| elevation || is_listener_plane(bus.direction))
+                        .copied(),
+                );
+            }
+            if filtered.is_empty() {
+                filtered.extend_from_slice(&self.buses);
+            }
+            &filtered
+        };
 
         let mut position = position;
         let mut size = size;
@@ -222,9 +233,9 @@ impl SpatialPanner {
 
         let pan = |at| {
             if size.iter().all(|value| value.abs() <= f32::EPSILON) {
-                point_gains(at, &permitted, self.output_bus_count)
+                point_gains(at, permitted, self.output_bus_count)
             } else {
-                extent_gains(at, size, &permitted, self.output_bus_count)
+                extent_gains(at, size, permitted, self.output_bus_count)
             }
         };
         let mut gains = if divergence <= f32::EPSILON {
@@ -459,7 +470,7 @@ const fn snap_target_permitted(kind: SnapZone, zone: ObjectZone, elevation: bool
     }
 }
 
-fn snapped_gains(position: [f32; 3], buses: &[&PanningBus], output_count: usize) -> Vec<f32> {
+fn snapped_gains(position: [f32; 3], buses: &[PanningBus], output_count: usize) -> Vec<f32> {
     let direction = source_direction(position);
     let closest = buses
         .iter()
@@ -476,7 +487,7 @@ fn snapped_gains(position: [f32; 3], buses: &[&PanningBus], output_count: usize)
     gains
 }
 
-fn point_gains(position: [f32; 3], buses: &[&PanningBus], output_count: usize) -> Vec<f32> {
+fn point_gains(position: [f32; 3], buses: &[PanningBus], output_count: usize) -> Vec<f32> {
     let mut direction = source_direction(position);
     // OAMD can place objects below the listener. Profiles without measured
     // lower routes project those positions onto the middle layer instead of
@@ -519,7 +530,7 @@ fn point_gains(position: [f32; 3], buses: &[&PanningBus], output_count: usize) -
 
 fn horizontal_vbap(
     direction: [f32; 3],
-    buses: &[&PanningBus],
+    buses: &[PanningBus],
     output_count: usize,
 ) -> Option<Vec<f32>> {
     let mut ground = buses
@@ -531,9 +542,8 @@ fn horizontal_vbap(
         return None;
     }
     ground.sort_by(|left, right| {
-        azimuth(left.direction)
-            .partial_cmp(&azimuth(right.direction))
-            .unwrap_or(Ordering::Equal)
+        left.azimuth
+            .total_cmp(&right.azimuth)
             .then_with(|| left.index.cmp(&right.index))
     });
     for index in 0..ground.len() {
@@ -562,23 +572,22 @@ fn horizontal_vbap(
 
 fn triplet_vbap(
     direction: [f32; 3],
-    buses: &[&PanningBus],
+    buses: &[PanningBus],
     output_count: usize,
 ) -> Option<Vec<f32>> {
     const EXHAUSTIVE_LIMIT: usize = 24;
     const LOCAL_CANDIDATES: usize = 12;
 
-    let mut candidates = buses.to_vec();
-    if candidates.len() > EXHAUSTIVE_LIMIT {
+    let best = if buses.len() <= EXHAUSTIVE_LIMIT {
+        containing_triplet(direction, buses)
+    } else {
+        let mut candidates = buses.to_vec();
         candidates.sort_by(|left, right| {
             dot(direction, right.direction).total_cmp(&dot(direction, left.direction))
         });
         candidates.truncate(LOCAL_CANDIDATES);
-    }
-    let mut best = containing_triplet(direction, &candidates);
-    if best.is_none() && candidates.len() != buses.len() {
-        best = containing_triplet(direction, buses);
-    }
+        containing_triplet(direction, &candidates).or_else(|| containing_triplet(direction, buses))
+    };
     let best = best?;
     let (indices, coefficients) = best;
     let mut gains = vec![0.0; output_count];
@@ -589,10 +598,7 @@ fn triplet_vbap(
     Some(gains)
 }
 
-fn containing_triplet(
-    direction: [f32; 3],
-    buses: &[&PanningBus],
-) -> Option<([usize; 3], [f32; 3])> {
+fn containing_triplet(direction: [f32; 3], buses: &[PanningBus]) -> Option<([usize; 3], [f32; 3])> {
     let mut best: Option<([usize; 3], [f32; 3], f32)> = None;
     for first in 0..buses.len() {
         for second in first + 1..buses.len() {
@@ -633,7 +639,7 @@ fn containing_triplet(
 
 fn inverse_angle_fallback(
     direction: [f32; 3],
-    buses: &[&PanningBus],
+    buses: &[PanningBus],
     output_count: usize,
 ) -> Vec<f32> {
     let mut nearest = buses
@@ -664,7 +670,7 @@ fn azimuth(direction: [f32; 3]) -> f32 {
 fn extent_gains(
     position: [f32; 3],
     size: [f32; 3],
-    buses: &[&PanningBus],
+    buses: &[PanningBus],
     output_count: usize,
 ) -> Vec<f32> {
     const ABSCISSA: f32 = 0.774_596_7;
@@ -844,8 +850,8 @@ fn normalize_power(gains: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PanningBus, SpatialPanner, bus_permitted, containing_triplet, direct_stereo_gains, dot,
-        is_height, is_mid, normalize_power, normalized, point_gains, snapped_position,
+        PanningBus, SpatialPanner, azimuth, bus_permitted, containing_triplet, direct_stereo_gains,
+        dot, is_height, is_mid, normalize_power, normalized, point_gains, snapped_position,
         triplet_vbap,
     };
     use crate::{
@@ -872,14 +878,13 @@ mod tests {
                 index,
                 speaker: Speaker::FrontCenter,
                 direction,
+                azimuth: azimuth(direction),
                 named: false,
             })
             .collect::<Vec<_>>();
-        let bus_refs = buses.iter().collect::<Vec<_>>();
-
         for direction in fibonacci_sphere(257) {
-            let local = triplet_vbap(direction, &bus_refs, buses.len()).unwrap();
-            let (indices, coefficients) = containing_triplet(direction, &bus_refs).unwrap();
+            let local = triplet_vbap(direction, &buses, buses.len()).unwrap();
+            let (indices, coefficients) = containing_triplet(direction, &buses).unwrap();
             let mut exhaustive = vec![0.0; buses.len()];
             for (index, coefficient) in indices.into_iter().zip(coefficients) {
                 exhaustive[index] = coefficient.max(0.0);
@@ -907,6 +912,7 @@ mod tests {
                 index,
                 speaker: Speaker::FrontCenter,
                 direction,
+                azimuth: azimuth(direction),
                 named: false,
             })
             .collect::<Vec<_>>();
@@ -916,10 +922,9 @@ mod tests {
             lfe_bus: None,
             stereo_trim_configuration: false,
         };
-        let bus_refs = panner.buses.iter().collect::<Vec<_>>();
         let mut maximum_error = 0.0_f32;
         for direction in fibonacci_sphere(4_096) {
-            let gains = point_gains(direction, &bus_refs, panner.output_bus_count);
+            let gains = point_gains(direction, &panner.buses, panner.output_bus_count);
             let rendered = panner.resultant_direction(&gains, direction);
             let error = dot(direction, rendered)
                 .clamp(-1.0, 1.0)
@@ -1361,17 +1366,22 @@ mod tests {
     }
 
     fn panner(speakers: &[Speaker]) -> SpatialPanner {
-        SpatialPanner {
-            buses: speakers
-                .iter()
-                .enumerate()
-                .map(|(index, speaker)| PanningBus {
+        let buses = speakers
+            .iter()
+            .enumerate()
+            .map(|(index, speaker)| {
+                let direction = normalized(speaker.position());
+                PanningBus {
                     index,
                     speaker: *speaker,
-                    direction: normalized(speaker.position()),
+                    direction,
+                    azimuth: azimuth(direction),
                     named: true,
-                })
-                .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        SpatialPanner {
+            buses,
             output_bus_count: speakers.len(),
             lfe_bus: None,
             stereo_trim_configuration: !speakers

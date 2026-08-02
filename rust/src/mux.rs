@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, ffi::OsString, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::{
     cli::OutputCodec,
@@ -78,8 +83,8 @@ pub struct AppendedTrack<'a> {
 
 #[derive(Debug)]
 pub struct MuxArguments {
-    pub media_stage: Vec<OsString>,
-    pub preservation_stage: Vec<OsString>,
+    pub arguments: Vec<OsString>,
+    pub progress: PathBuf,
 }
 
 /// Returns the source manifest used for replacement muxing, excluding tracks
@@ -172,26 +177,29 @@ pub fn build_mux_arguments(
         .iter()
         .filter(|stream| stream.codec_type == "audio")
         .count();
-    let mut media_stage = [
+    let mut arguments = [
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "warning",
-        "-copyts",
-        "-avoid_negative_ts",
-        "disabled",
-        "-i",
+        "-nostats",
+        "-stats_period",
+        "5",
+        "-progress",
     ]
     .map(OsString::from)
     .to_vec();
-    media_stage.push(input.as_os_str().to_os_string());
+    let progress = partial_output.with_file_name("mux-progress.txt");
+    arguments.push(progress.as_os_str().to_os_string());
+    arguments.extend(["-copyts", "-avoid_negative_ts", "disabled", "-i"].map(OsString::from));
+    arguments.push(input.as_os_str().to_os_string());
     for track in appended_tracks {
         if selected_start.abs() > f64::EPSILON {
-            media_stage.push("-itsoffset".into());
-            media_stage.push(format_timestamp(selected_start).into());
+            arguments.push("-itsoffset".into());
+            arguments.push(format_timestamp(selected_start).into());
         }
-        media_stage.push("-i".into());
-        media_stage.push(track.path.as_os_str().to_os_string());
+        arguments.push("-i".into());
+        arguments.push(track.path.as_os_str().to_os_string());
     }
     let media_source_positions = source
         .streams
@@ -208,67 +216,47 @@ pub fn build_mux_arguments(
         .map(|(position, _)| position)
         .collect::<Vec<_>>();
     for position in &media_source_positions {
-        media_stage.push("-map".into());
-        media_stage.push(format!("0:{}", source.streams[*position].index).into());
+        arguments.push("-map".into());
+        arguments.push(format!("0:{}", source.streams[*position].index).into());
     }
     for input_index in 1..=appended_tracks.len() {
-        media_stage.push("-map".into());
-        media_stage.push(format!("{input_index}:a:0").into());
+        arguments.push("-map".into());
+        arguments.push(format!("{input_index}:a:0").into());
     }
-    media_stage
-        .extend(["-map_metadata", "-1", "-map_chapters", "-1", "-c", "copy"].map(OsString::from));
+    for position in &preservation_source_positions {
+        arguments.push("-map".into());
+        arguments.push(format!("0:{}", source.streams[*position].index).into());
+    }
+    arguments
+        .extend(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"].map(OsString::from));
     for (offset, track) in appended_tracks.iter().enumerate() {
         let output_audio_index = new_audio_index + offset;
-        media_stage.push(format!("-c:a:{output_audio_index}").into());
+        arguments.push(format!("-c:a:{output_audio_index}").into());
         match track.codec {
             OutputCodec::Flac => {
-                media_stage.push("flac".into());
-                media_stage.push(format!("-compression_level:a:{output_audio_index}").into());
-                media_stage.push(FLAC_COMPRESSION_LEVEL.into());
+                arguments.push("flac".into());
+                arguments.push(format!("-compression_level:a:{output_audio_index}").into());
+                arguments.push(FLAC_COMPRESSION_LEVEL.into());
             }
             OutputCodec::Aac => {
-                media_stage.push("aac".into());
-                media_stage.push(format!("-b:a:{output_audio_index}").into());
-                media_stage.push(AAC_BITRATE.into());
-                media_stage.push(format!("-aac_coder:a:{output_audio_index}").into());
-                media_stage.push(AAC_CODER.into());
+                arguments.push("aac".into());
+                arguments.push(format!("-b:a:{output_audio_index}").into());
+                arguments.push(AAC_BITRATE.into());
+                arguments.push(format!("-aac_coder:a:{output_audio_index}").into());
+                arguments.push(AAC_CODER.into());
             }
         }
     }
-    media_stage.extend(["-f", "matroska", "pipe:1"].map(OsString::from));
-
-    let mut preservation_stage = [
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-copyts",
-        "-avoid_negative_ts",
-        "disabled",
-        "-i",
-        "pipe:0",
-        "-i",
-    ]
-    .map(OsString::from)
-    .to_vec();
-    preservation_stage.push(input.as_os_str().to_os_string());
-    preservation_stage.extend(["-map", "0"].map(OsString::from));
-    for position in &preservation_source_positions {
-        preservation_stage.push("-map".into());
-        preservation_stage.push(format!("1:{}", source.streams[*position].index).into());
-    }
-    preservation_stage.extend(["-map_metadata", "1", "-map_chapters", "1"].map(OsString::from));
     if source
         .streams
         .iter()
         .any(|stream| matches!(stream.codec_type.as_str(), "data" | "unknown"))
     {
-        preservation_stage.push("-copy_unknown".into());
+        arguments.push("-copy_unknown".into());
     }
-    preservation_stage.extend(["-c", "copy"].map(OsString::from));
     for (key, value) in &source.format.tags {
-        preservation_stage.push("-metadata".into());
-        preservation_stage.push(format!("{key}={value}").into());
+        arguments.push("-metadata".into());
+        arguments.push(format!("{key}={value}").into());
     }
     let mut output_positions = vec![0; source.streams.len()];
     for (output_position, source_position) in media_source_positions.iter().enumerate() {
@@ -281,11 +269,11 @@ pub fn build_mux_arguments(
     for (source_position, stream) in source.streams.iter().enumerate() {
         let output_position = output_positions[source_position];
         for (key, value) in &stream.tags {
-            preservation_stage.push(format!("-metadata:s:{output_position}").into());
-            preservation_stage.push(format!("{key}={value}").into());
+            arguments.push(format!("-metadata:s:{output_position}").into());
+            arguments.push(format!("{key}={value}").into());
         }
-        preservation_stage.push(format!("-disposition:{output_position}").into());
-        preservation_stage.push(disposition_value(&stream.disposition).into());
+        arguments.push(format!("-disposition:{output_position}").into());
+        arguments.push(disposition_value(&stream.disposition).into());
     }
 
     let language = selected_source
@@ -293,23 +281,24 @@ pub fn build_mux_arguments(
         .filter(|value| !value.trim().is_empty());
     for (offset, track) in appended_tracks.iter().enumerate() {
         let audio_index = new_audio_index + offset;
-        preservation_stage.push(format!("-metadata:s:a:{audio_index}").into());
-        preservation_stage.push(format!("title={}", track.title).into());
+        arguments.push(format!("-metadata:s:a:{audio_index}").into());
+        arguments.push(format!("title={}", track.title).into());
         if let Some(language) = language {
-            preservation_stage.push(format!("-metadata:s:a:{audio_index}").into());
-            preservation_stage.push(format!("language={language}").into());
+            arguments.push(format!("-metadata:s:a:{audio_index}").into());
+            arguments.push(format!("language={language}").into());
         }
-        preservation_stage.push(format!("-disposition:a:{audio_index}").into());
-        preservation_stage.push("0".into());
+        arguments.push(format!("-disposition:a:{audio_index}").into());
+        arguments.push("0".into());
     }
+    arguments.extend(["-f", "matroska"].map(OsString::from));
     for (key, value) in advanced {
-        preservation_stage.push(key.into());
-        preservation_stage.push(value.into());
+        arguments.push(key.into());
+        arguments.push(value.into());
     }
-    preservation_stage.push(partial_output.as_os_str().to_os_string());
+    arguments.push(partial_output.as_os_str().to_os_string());
     Ok(MuxArguments {
-        media_stage,
-        preservation_stage,
+        arguments,
+        progress,
     })
 }
 
@@ -323,20 +312,14 @@ pub fn mux(
     ffmpeg: &Path,
     arguments: &MuxArguments,
 ) -> Result<(), AppError> {
-    let output = runner.run_pipeline(
-        ffmpeg,
-        &arguments.media_stage,
-        ffmpeg,
-        &arguments.preservation_stage,
-    )?;
-    if output.producer_status.success() && output.consumer_status.success() {
+    let output = runner.run(ffmpeg, &arguments.arguments)?;
+    if output.status.success() {
         return Ok(());
     }
-    let producer_detail = concise_ffmpeg_error(&output.producer_stderr);
-    let consumer_detail = concise_ffmpeg_error(&output.consumer_stderr);
+    let detail = concise_ffmpeg_error(&output.stderr);
     Err(AppError::Mux(format!(
-        "ffmpeg mux pipeline failed (media stage {}, preservation stage {}): media: {producer_detail}; preservation: {consumer_detail}",
-        output.producer_status, output.consumer_status
+        "ffmpeg preservation mux failed ({}): {detail}",
+        output.status
     )))
 }
 
@@ -823,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn mux_interleaves_media_before_adding_sparse_streams() {
+    fn mux_interleaves_appended_audio_before_sparse_streams_in_one_pass() {
         let mut source = source_manifest();
         source.streams.push(stream(2, "subtitle", "subrip"));
         let rendered = [AppendedTrack {
@@ -850,18 +833,20 @@ mod tests {
             "language=eng",
             "-disposition:a:1",
             "0",
+            "-f",
+            "matroska",
             "-cluster_time_limit",
             "5000",
             "partial.mkv",
         ]
         .map(OsString::from);
         assert!(
-            args.media_stage
+            args.arguments
                 .windows(4)
                 .any(|window| window == os_slice(["-map", "0:1", "-map", "1:a:0"]))
         );
         assert!(
-            args.media_stage.windows(4).any(|window| {
+            args.arguments.windows(4).any(|window| {
                 window
                     == os_slice([
                         "-c:a:1",
@@ -870,33 +855,27 @@ mod tests {
                         FLAC_COMPRESSION_LEVEL,
                     ])
             }),
-            "media stage did not request the fast lossless FLAC delivery encode"
+            "mux did not request the fast lossless FLAC delivery encode"
         );
         assert!(
             !args
-                .media_stage
+                .arguments
                 .iter()
                 .any(|argument| argument.to_string_lossy().starts_with("-filter")),
             "finishing must happen in the renderer before lossless delivery"
         );
         assert!(
-            !args
-                .media_stage
-                .windows(2)
-                .any(|window| window == os_slice(["-map", "0:2"]))
-        );
-        assert!(
-            args.preservation_stage
+            args.arguments
                 .windows(4)
-                .any(|window| window == os_slice(["-map", "0", "-map", "1:2"]))
+                .any(|window| window == os_slice(["-map", "1:a:0", "-map", "0:2"]))
         );
         assert!(
-            args.preservation_stage
+            args.arguments
                 .windows(2)
                 .any(|window| window == os_slice(["-c", "copy"])),
-            "preservation stage must remain copy-only"
+            "original streams must remain copy-only"
         );
-        assert!(args.preservation_stage.ends_with(&expected_tail));
+        assert!(args.arguments.ends_with(&expected_tail));
     }
 
     #[test]

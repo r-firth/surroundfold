@@ -20,6 +20,7 @@ mod object_render;
 mod parametric;
 pub mod paths;
 pub mod process;
+mod progress;
 pub mod qmf;
 mod qmf_tables;
 pub mod render;
@@ -40,7 +41,7 @@ use std::{
 };
 
 use cancel::Cancellation;
-use cli::{Cli, DistanceRendererMode, ObjectRendererMode, ProgressMode, Toggle};
+use cli::{Cli, ProgressMode, Toggle};
 use eac3_render::{Eac3RenderOptions, render_eac3_track};
 use error::AppError;
 use hrir::HrirSet;
@@ -51,6 +52,7 @@ use mux::{
 };
 use paths::ResolvedPaths;
 use process::ProcessRunner;
+use progress::ProgressMonitor;
 use render::{ChannelRenderOptions, render_channel_track};
 use room::RoomCorrection;
 use selection::{AudioTrack, DecodeCapability, select_track};
@@ -127,6 +129,9 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
     let preparation_seconds = total_started.elapsed().as_secs_f64();
     let render_started = Instant::now();
     report(cli.progress, "rendering binaural track");
+    let media_duration = progress_duration(&manifest, selected_stream);
+    let render_progress =
+        ProgressMonitor::render(cli.progress, &rendered, media_duration, hrir.sample_rate);
     let render = match selected.capability {
         DecodeCapability::Channels => {
             let decoded = workspace.file("selected.f32le")?;
@@ -213,6 +218,7 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
             ));
         }
     };
+    drop(render_progress);
     let render_seconds = render_started.elapsed().as_secs_f64();
     report(
         cli.progress,
@@ -259,7 +265,9 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
         cli.progress,
         "encoding delivery track and muxing preservation copy",
     );
+    let mux_progress = ProgressMonitor::mux(cli.progress, &mux_arguments.progress, media_duration);
     mux(&runner, &ffmpeg, &mux_arguments)?;
+    drop(mux_progress);
     let encode_mux_seconds = encode_mux_started.elapsed().as_secs_f64();
     report(
         cli.progress,
@@ -343,17 +351,6 @@ fn validate_implemented_options(cli: &Cli, capability: DecodeCapability) -> Resu
                 .filter_map(|(enabled, name)| enabled.then_some(name)),
         );
     }
-    if capability == DecodeCapability::Channels
-        && (cli.object_renderer != ObjectRendererMode::Baseline
-            || cli.distance_renderer != DistanceRendererMode::Baseline)
-    {
-        if cli.object_renderer != ObjectRendererMode::Baseline {
-            unsupported.push("--object-renderer");
-        }
-        if cli.distance_renderer != DistanceRendererMode::Baseline {
-            unsupported.push("--distance-renderer");
-        }
-    }
     if unsupported.is_empty() {
         Ok(())
     } else {
@@ -368,6 +365,18 @@ fn report(mode: ProgressMode, message: &str) {
     if mode == ProgressMode::Text {
         eprintln!("{message}");
     }
+}
+
+fn progress_duration(
+    manifest: &media::ContainerManifest,
+    stream: &media::StreamManifest,
+) -> Option<f64> {
+    stream.duration.or_else(|| {
+        let duration = manifest.format.duration?;
+        let format_start = manifest.format.start_time.unwrap_or(0.0);
+        let stream_start = stream.start_time.unwrap_or(format_start);
+        Some(duration - (stream_start - format_start).max(0.0))
+    })
 }
 
 fn print_tracks(tracks: &[AudioTrack], mode: ProgressMode) -> Result<(), AppError> {

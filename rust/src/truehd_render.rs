@@ -113,31 +113,48 @@ fn decode_and_render(
     relaxed_validation: bool,
     renderer: &mut ObjectRenderer<'_>,
 ) -> Result<(), AppError> {
-    const PIPELINE_FRAMES: usize = 4;
-    let (sender, receiver) = sync_channel(PIPELINE_FRAMES);
+    const FRAMES_PER_BATCH: usize = 128;
+    const PIPELINE_BATCHES: usize = 4;
+    let (sender, receiver) = sync_channel(PIPELINE_BATCHES);
     thread::scope(|scope| {
         let decoder = scope.spawn(move || {
-            decode_stream(input, presentation, relaxed_validation, |frame| {
+            let mut batch = Vec::with_capacity(FRAMES_PER_BATCH);
+            let result = decode_stream(input, presentation, relaxed_validation, |frame| {
                 runner.check_cancelled()?;
+                batch.push(frame);
+                if batch.len() == FRAMES_PER_BATCH {
+                    sender
+                        .send(std::mem::replace(
+                            &mut batch,
+                            Vec::with_capacity(FRAMES_PER_BATCH),
+                        ))
+                        .map_err(|_| AppError::Render("TrueHD render pipeline stopped".into()))?;
+                }
+                Ok(())
+            });
+            if result.is_ok() && !batch.is_empty() {
                 sender
-                    .send(frame)
-                    .map_err(|_| AppError::Render("TrueHD render pipeline stopped".into()))
-            })
+                    .send(batch)
+                    .map_err(|_| AppError::Render("TrueHD render pipeline stopped".into()))?;
+            }
+            result
         });
 
         let mut render_result = Ok(());
-        while let Ok(frame) = receiver.recv() {
-            if let Err(error) = renderer.push(ObjectPcmFrame {
-                sample_rate: frame.sample_rate,
-                sample_count: frame.sample_count,
-                channel_count: frame.channel_count,
-                samples: frame.samples,
-                channel_speakers: frame.channel_speakers,
-                isf: frame.isf,
-                spatial_updates: frame.spatial_updates,
-            }) {
-                render_result = Err(error);
-                break;
+        'pipeline: while let Ok(batch) = receiver.recv() {
+            for frame in batch {
+                if let Err(error) = renderer.push(ObjectPcmFrame {
+                    sample_rate: frame.sample_rate,
+                    sample_count: frame.sample_count,
+                    channel_count: frame.channel_count,
+                    samples: frame.samples,
+                    channel_speakers: frame.channel_speakers,
+                    isf: frame.isf,
+                    spatial_updates: frame.spatial_updates,
+                }) {
+                    render_result = Err(error);
+                    break 'pipeline;
+                }
             }
         }
         drop(receiver);

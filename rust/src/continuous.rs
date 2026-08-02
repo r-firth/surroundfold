@@ -1,6 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
 use rustfft::FftPlanner;
+#[cfg(target_arch = "x86_64")]
+use wide::f32x8;
 
 use crate::parametric::{MAXIMUM_ITD_SECONDS, ParametricHrtfModel, minimum_phase_impulse};
 
@@ -21,8 +23,8 @@ const WOODWORTH_MAXIMUM_ANGLE_TERM: f32 = std::f32::consts::FRAC_PI_2 + 1.0;
 pub(crate) const FRACTIONAL_DELAY_GUARD_FRAMES: usize = FRACTIONAL_DELAY_PRE_SAMPLES;
 
 struct GridFilter {
-    left: Box<[f32]>,
-    right: Box<[f32]>,
+    left: [f32; FILTER_LENGTH],
+    right: [f32; FILTER_LENGTH],
 }
 
 pub(crate) struct ContinuousHrtfGrid {
@@ -32,8 +34,8 @@ pub(crate) struct ContinuousHrtfGrid {
 }
 
 pub(crate) struct ContinuousTarget {
-    left: Vec<f32>,
-    right: Vec<f32>,
+    left: [f32; FILTER_LENGTH],
+    right: [f32; FILTER_LENGTH],
     left_delay: f32,
     right_delay: f32,
 }
@@ -56,23 +58,20 @@ impl ContinuousHrtfGrid {
                     elevation.sin(),
                 ];
                 let (left_magnitude, right_magnitude) = model.magnitudes(direction, SYNTHESIS_FFT);
+                let synthesize = |magnitude| {
+                    minimum_phase_impulse(
+                        magnitude,
+                        SYNTHESIS_FFT,
+                        FILTER_LENGTH,
+                        forward.as_ref(),
+                        inverse.as_ref(),
+                    )
+                    .try_into()
+                    .expect("continuous HRTF synthesis returned the requested filter length")
+                };
                 filters.push(GridFilter {
-                    left: minimum_phase_impulse(
-                        &left_magnitude,
-                        SYNTHESIS_FFT,
-                        FILTER_LENGTH,
-                        forward.as_ref(),
-                        inverse.as_ref(),
-                    )
-                    .into_boxed_slice(),
-                    right: minimum_phase_impulse(
-                        &right_magnitude,
-                        SYNTHESIS_FFT,
-                        FILTER_LENGTH,
-                        forward.as_ref(),
-                        inverse.as_ref(),
-                    )
-                    .into_boxed_slice(),
+                    left: synthesize(&left_magnitude),
+                    right: synthesize(&right_magnitude),
                 });
             }
         }
@@ -107,23 +106,27 @@ impl ContinuousHrtfGrid {
         let lower_right = self.filter(elevation_lower, azimuth_upper);
         let upper_left = self.filter(elevation_upper, azimuth_lower);
         let upper_right = self.filter(elevation_upper, azimuth_upper);
-        let interpolate = |index: usize, channel: fn(&GridFilter) -> &[f32]| {
-            let lower = channel(lower_left)[index].mul_add(
-                1.0 - azimuth_fraction,
-                channel(lower_right)[index] * azimuth_fraction,
-            );
-            let upper = channel(upper_left)[index].mul_add(
-                1.0 - azimuth_fraction,
-                channel(upper_right)[index] * azimuth_fraction,
-            );
+        let interpolate = |lower_left: f32, lower_right: f32, upper_left: f32, upper_right: f32| {
+            let lower = lower_left.mul_add(1.0 - azimuth_fraction, lower_right * azimuth_fraction);
+            let upper = upper_left.mul_add(1.0 - azimuth_fraction, upper_right * azimuth_fraction);
             lower.mul_add(1.0 - elevation_fraction, upper * elevation_fraction)
         };
-        let left = (0..FILTER_LENGTH)
-            .map(|index| interpolate(index, |filter| &filter.left))
-            .collect();
-        let right = (0..FILTER_LENGTH)
-            .map(|index| interpolate(index, |filter| &filter.right))
-            .collect();
+        let left = std::array::from_fn(|index| {
+            interpolate(
+                lower_left.left[index],
+                lower_right.left[index],
+                upper_left.left[index],
+                upper_right.left[index],
+            )
+        });
+        let right = std::array::from_fn(|index| {
+            interpolate(
+                lower_left.right[index],
+                lower_right.right[index],
+                upper_left.right[index],
+                upper_right.right[index],
+            )
+        });
 
         // Projection onto the interaural axis naturally weakens lateral cues
         // with elevation and has no singularity at either vertical pole.
@@ -159,39 +162,46 @@ pub(crate) struct ContinuousBinaural {
     grid: Arc<ContinuousHrtfGrid>,
     history: Vec<f32>,
     cursor: usize,
-    left: Vec<f32>,
-    right: Vec<f32>,
-    left_step: Vec<f32>,
-    right_step: Vec<f32>,
+    left: [f32; FILTER_LENGTH],
+    right: [f32; FILTER_LENGTH],
+    left_step: [f32; FILTER_LENGTH],
+    right_step: [f32; FILTER_LENGTH],
     left_delay: f32,
     right_delay: f32,
     left_delay_step: f32,
     right_delay_step: f32,
+    filter_moving: bool,
+    delay_moving: bool,
     remaining: usize,
-    left_delay_line: FractionalDelay,
-    right_delay_line: FractionalDelay,
+    active_tail: usize,
+    tail_frames: usize,
+    delay_line: StereoFractionalDelay,
 }
 
 impl ContinuousBinaural {
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn new(grid: Arc<ContinuousHrtfGrid>, direction: [f32; 3]) -> Self {
         let target = grid.target(direction);
-        let delay_capacity = grid.maximum_tail_frames().max(8);
+        let tail_frames = grid.maximum_tail_frames();
+        let delay_capacity = tail_frames.max(8);
         Self {
             grid,
             history: vec![0.0; FILTER_LENGTH * 2],
             cursor: 0,
-            left_step: vec![0.0; FILTER_LENGTH],
-            right_step: vec![0.0; FILTER_LENGTH],
+            left_step: [0.0; FILTER_LENGTH],
+            right_step: [0.0; FILTER_LENGTH],
             left: target.left,
             right: target.right,
             left_delay: target.left_delay,
             right_delay: target.right_delay,
             left_delay_step: 0.0,
             right_delay_step: 0.0,
+            filter_moving: false,
+            delay_moving: false,
             remaining: 0,
-            left_delay_line: FractionalDelay::new(delay_capacity),
-            right_delay_line: FractionalDelay::new(delay_capacity),
+            active_tail: 0,
+            tail_frames,
+            delay_line: StereoFractionalDelay::new(delay_capacity),
         }
     }
 
@@ -207,6 +217,8 @@ impl ContinuousBinaural {
             self.right_delay = target.right_delay;
             self.left_delay_step = 0.0;
             self.right_delay_step = 0.0;
+            self.filter_moving = false;
+            self.delay_moving = false;
             self.remaining = 0;
             return;
         }
@@ -225,47 +237,70 @@ impl ContinuousBinaural {
         }
         self.left_delay_step = (target.left_delay - self.left_delay) / duration;
         self.right_delay_step = (target.right_delay - self.right_delay) / duration;
+        self.filter_moving = self
+            .left_step
+            .iter()
+            .chain(&self.right_step)
+            .any(|step| *step != 0.0);
+        self.delay_moving = self.left_delay_step != 0.0 || self.right_delay_step != 0.0;
         self.remaining = frames;
     }
 
     pub(crate) fn process(&mut self, input: f32) -> [f32; 2] {
-        self.cursor = (self.cursor + FILTER_LENGTH - 1) % FILTER_LENGTH;
+        if input == 0.0 && self.active_tail == 0 {
+            self.advance();
+            return [0.0; 2];
+        }
+        if input == 0.0 {
+            self.active_tail -= 1;
+        } else {
+            self.active_tail = self.tail_frames;
+        }
+        self.cursor = if self.cursor == 0 {
+            FILTER_LENGTH - 1
+        } else {
+            self.cursor - 1
+        };
         self.history[self.cursor] = input;
         self.history[self.cursor + FILTER_LENGTH] = input;
         let samples = &self.history[self.cursor..self.cursor + FILTER_LENGTH];
-        let left = dot(samples, &self.left);
-        let right = dot(samples, &self.right);
-        let output = [
-            self.left_delay_line.process(left, self.left_delay),
-            self.right_delay_line.process(right, self.right_delay),
-        ];
+        let [left, right] = stereo_dot(samples, &self.left, &self.right);
+        let output = self
+            .delay_line
+            .process([left, right], [self.left_delay, self.right_delay]);
         self.advance();
         output
     }
 
     #[must_use]
     pub(crate) fn tail_frames(&self) -> usize {
-        self.grid.maximum_tail_frames()
+        self.tail_frames
     }
 
     fn advance(&mut self) {
         if self.remaining == 0 {
             return;
         }
-        for (value, step) in self.left.iter_mut().zip(&self.left_step) {
-            *value += step;
+        if self.filter_moving {
+            for (value, step) in self.left.iter_mut().zip(&self.left_step) {
+                *value += step;
+            }
+            for (value, step) in self.right.iter_mut().zip(&self.right_step) {
+                *value += step;
+            }
         }
-        for (value, step) in self.right.iter_mut().zip(&self.right_step) {
-            *value += step;
+        if self.delay_moving {
+            self.left_delay += self.left_delay_step;
+            self.right_delay += self.right_delay_step;
         }
-        self.left_delay += self.left_delay_step;
-        self.right_delay += self.right_delay_step;
         self.remaining -= 1;
         if self.remaining == 0 {
             self.left_step.fill(0.0);
             self.right_step.fill(0.0);
             self.left_delay_step = 0.0;
             self.right_delay_step = 0.0;
+            self.filter_moving = false;
+            self.delay_moving = false;
         }
     }
 }
@@ -275,23 +310,66 @@ fn woodworth_itd_seconds(lateral: f32) -> f32 {
     MAXIMUM_ITD_SECONDS * (lateral.asin() + lateral) / WOODWORTH_MAXIMUM_ANGLE_TERM
 }
 
-fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| left * right)
-        .sum()
+#[cfg(not(target_arch = "x86_64"))]
+fn stereo_dot(samples: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
+    let mut output = [0.0; 2];
+    for ((sample, left), right) in samples.iter().zip(left).zip(right) {
+        output[0] += sample * left;
+        output[1] += sample * right;
+    }
+    output
 }
 
-struct FractionalDelay {
-    samples: Vec<f32>,
+#[cfg(target_arch = "x86_64")]
+fn stereo_dot(samples: &[f32], left: &[f32], right: &[f32]) -> [f32; 2] {
+    let mut left_sum = [f32x8::ZERO; 2];
+    let mut right_sum = [f32x8::ZERO; 2];
+    for tap in (0..FILTER_LENGTH).step_by(16) {
+        for lane in 0..2 {
+            let start = tap + lane * 8;
+            let end = start + 8;
+            let samples = f32x8::new(samples[start..end].try_into().expect("eight samples"));
+            let left = f32x8::new(left[start..end].try_into().expect("eight left taps"));
+            let right = f32x8::new(right[start..end].try_into().expect("eight right taps"));
+            left_sum[lane] = samples.mul_add(left, left_sum[lane]);
+            right_sum[lane] = samples.mul_add(right, right_sum[lane]);
+        }
+    }
+    [
+        (left_sum[0] + left_sum[1]).reduce_add(),
+        (right_sum[0] + right_sum[1]).reduce_add(),
+    ]
+}
+
+struct StereoFractionalDelay {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    capacity: usize,
     cursor: usize,
+    table: &'static [[f32; FRACTIONAL_DELAY_TAPS]],
+    cache: [FractionalDelayCache; 2],
 }
 
-impl FractionalDelay {
+struct FractionalDelayCache {
+    delay: u32,
+    whole: usize,
+    kernel: &'static [f32; FRACTIONAL_DELAY_TAPS],
+}
+
+impl StereoFractionalDelay {
     fn new(capacity: usize) -> Self {
+        let table = fractional_delay_table();
         Self {
-            samples: vec![0.0; capacity],
+            left: vec![0.0; capacity * 2],
+            right: vec![0.0; capacity * 2],
+            capacity,
             cursor: 0,
+            table,
+            cache: std::array::from_fn(|_| FractionalDelayCache {
+                delay: u32::MAX,
+                whole: 0,
+                kernel: &table[0],
+            }),
         }
     }
 
@@ -300,12 +378,118 @@ impl FractionalDelay {
         clippy::cast_precision_loss,
         clippy::cast_sign_loss
     )]
-    fn process(&mut self, input: f32, delay: f32) -> f32 {
-        self.samples[self.cursor] = input;
-        let output = fractional_delay_read(&self.samples, self.cursor, delay);
-        self.cursor = (self.cursor + 1) % self.samples.len();
+    fn process(&mut self, input: [f32; 2], delay: [f32; 2]) -> [f32; 2] {
+        self.left[self.cursor] = input[0];
+        self.left[self.cursor + self.capacity] = input[0];
+        self.right[self.cursor] = input[1];
+        self.right[self.cursor + self.capacity] = input[1];
+        let minimum = FRACTIONAL_DELAY_GUARD_FRAMES as f32;
+        let maximum = self
+            .capacity
+            .saturating_sub(FRACTIONAL_DELAY_POST_SAMPLES + 2) as f32;
+        for (cache, delay) in self.cache.iter_mut().zip(delay) {
+            let delay = delay.clamp(minimum, maximum.max(minimum));
+            let delay_bits = delay.to_bits();
+            if cache.delay != delay_bits {
+                cache.whole = delay.floor() as usize;
+                let phase = fractional_delay_phase(delay - cache.whole as f32);
+                cache.kernel = &self.table[phase];
+                cache.delay = delay_bits;
+            }
+        }
+        let left_first = self.cursor + self.cache[0].whole - FRACTIONAL_DELAY_PRE_SAMPLES;
+        let right_first = self.cursor + self.cache[1].whole - FRACTIONAL_DELAY_PRE_SAMPLES;
+        let left = &self.left[left_first..left_first + FRACTIONAL_DELAY_TAPS];
+        let right = &self.right[right_first..right_first + FRACTIONAL_DELAY_TAPS];
+        let output = stereo_fractional_dot(left, right, self.cache[0].kernel, self.cache[1].kernel);
+        self.cursor = if self.cursor == 0 {
+            self.capacity - 1
+        } else {
+            self.cursor - 1
+        };
         output
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn stereo_fractional_dot(
+    left: &[f32],
+    right: &[f32],
+    left_kernel: &[f32],
+    right_kernel: &[f32],
+) -> [f32; 2] {
+    let mut output = [0.0; 2];
+    for tap in 0..FRACTIONAL_DELAY_TAPS {
+        output[0] = left[tap].mul_add(left_kernel[tap], output[0]);
+        output[1] = right[tap].mul_add(right_kernel[tap], output[1]);
+    }
+    output
+}
+
+#[cfg(target_arch = "x86_64")]
+fn stereo_fractional_dot(
+    left: &[f32],
+    right: &[f32],
+    left_kernel: &[f32],
+    right_kernel: &[f32],
+) -> [f32; 2] {
+    let mut left_sum = [f32x8::ZERO; 3];
+    let mut right_sum = [f32x8::ZERO; 3];
+    for (chunk, tap) in (0..FRACTIONAL_DELAY_TAPS).step_by(8).enumerate() {
+        let end = tap + 8;
+        let left = f32x8::new(left[tap..end].try_into().expect("eight left samples"));
+        let right = f32x8::new(right[tap..end].try_into().expect("eight right samples"));
+        let left_kernel = f32x8::new(left_kernel[tap..end].try_into().expect("eight left taps"));
+        let right_kernel = f32x8::new(right_kernel[tap..end].try_into().expect("eight right taps"));
+        left_sum[chunk] = left * left_kernel;
+        right_sum[chunk] = right * right_kernel;
+    }
+    [
+        ((left_sum[0] + left_sum[1]) + left_sum[2]).reduce_add(),
+        ((right_sum[0] + right_sum[1]) + right_sum[2]).reduce_add(),
+    ]
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn fractional_delay_read_duplicated(
+    samples: &[f32],
+    capacity: usize,
+    cursor: usize,
+    delay: f32,
+    table: &[[f32; FRACTIONAL_DELAY_TAPS]],
+) -> f32 {
+    debug_assert_eq!(samples.len(), capacity * 2);
+    let minimum = FRACTIONAL_DELAY_GUARD_FRAMES as f32;
+    let maximum = capacity.saturating_sub(FRACTIONAL_DELAY_POST_SAMPLES + 2) as f32;
+    let delay = delay.clamp(minimum, maximum.max(minimum));
+    let whole = delay.floor() as usize;
+    let fraction = delay - whole as f32;
+    let coefficients = &table[fractional_delay_phase(fraction)];
+    fractional_delay_read_prepared(samples, capacity, cursor, whole, coefficients)
+}
+
+#[cfg(test)]
+fn fractional_delay_read_prepared(
+    samples: &[f32],
+    capacity: usize,
+    cursor: usize,
+    whole: usize,
+    coefficients: &[f32; FRACTIONAL_DELAY_TAPS],
+) -> f32 {
+    let newest = cursor + capacity - (whole - FRACTIONAL_DELAY_PRE_SAMPLES);
+    let ordered_samples = samples[newest + 1 - FRACTIONAL_DELAY_TAPS..=newest]
+        .iter()
+        .rev();
+    let mut output = 0.0;
+    for (sample, coefficient) in ordered_samples.zip(coefficients) {
+        output = sample.mul_add(*coefficient, output);
+    }
+    output
 }
 
 #[allow(
@@ -426,16 +610,17 @@ mod tests {
     use super::{
         ContinuousBinaural, ContinuousHrtfGrid, FRACTIONAL_DELAY_GUARD_FRAMES,
         FRACTIONAL_DELAY_POST_SAMPLES, FRACTIONAL_DELAY_PRE_SAMPLES, FRACTIONAL_DELAY_TAPS,
-        FractionalDelay, SYNTHESIS_FFT, fractional_delay_phase, fractional_delay_table,
+        SYNTHESIS_FFT, StereoFractionalDelay, fractional_delay_phase, fractional_delay_read,
+        fractional_delay_read_duplicated, fractional_delay_table,
     };
     use crate::hrir::{HrirSet, Speaker};
     use crate::{binaural::PanningRoute, parametric::ParametricHrtfModel};
 
     #[test]
     fn bandlimited_delay_preserves_integer_samples() {
-        let mut delay = FractionalDelay::new(64);
+        let mut delay = StereoFractionalDelay::new(64);
         let output = (0..32)
-            .map(|index| delay.process(if index == 0 { 1.0 } else { 0.0 }, 2.0))
+            .map(|index| delay.process([if index == 0 { 1.0 } else { 0.0 }, 0.0], [2.0; 2])[0])
             .collect::<Vec<_>>();
         assert!((output[FRACTIONAL_DELAY_GUARD_FRAMES] - 1.0).abs() < f32::EPSILON);
         assert!(
@@ -445,6 +630,54 @@ mod tests {
                 .all(|(index, sample)| index == FRACTIONAL_DELAY_GUARD_FRAMES
                     || sample.abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn duplicated_delay_line_is_bit_exact_with_the_ring_reader() {
+        let capacity = 64;
+        let samples = (0..capacity)
+            .map(|index| (index as f32 * 0.371).sin())
+            .collect::<Vec<_>>();
+        let mut duplicated = samples.clone();
+        duplicated.extend_from_slice(&samples);
+        for cursor in 0..capacity {
+            for delay in [11.0, 11.37, 18.75, 31.125, 49.999] {
+                assert_eq!(
+                    fractional_delay_read_duplicated(
+                        &duplicated,
+                        capacity,
+                        cursor,
+                        delay,
+                        fractional_delay_table(),
+                    )
+                    .to_bits(),
+                    fractional_delay_read(&samples, cursor, delay).to_bits(),
+                    "cursor {cursor}, delay {delay}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn descending_delay_line_is_bit_exact_with_the_ring_reader() {
+        let capacity = 64;
+        let mut optimized = StereoFractionalDelay::new(capacity);
+        let mut reference = vec![0.0; capacity];
+        let mut cursor = 0;
+        for frame in 0..4_096 {
+            let input = (frame as f32 * 0.371).sin();
+            let delay = 11.0 + (frame % 37) as f32 * 0.73;
+            reference[cursor] = input;
+            let expected = fractional_delay_read(&reference, cursor, delay);
+            let actual = optimized.process([input, -input], [delay, delay])[0];
+            assert_eq!(actual.to_bits(), expected.to_bits(), "frame {frame}");
+            cursor += 1;
+            if cursor == capacity {
+                cursor = 0;
+            }
+        }
     }
 
     #[test]
@@ -691,6 +924,30 @@ mod tests {
             maximum_delta < 0.2,
             "moving continuous filter jumped by {maximum_delta} at frame {maximum_frame}"
         );
+    }
+
+    #[test]
+    fn silent_fast_path_is_bit_exact_after_the_finite_tail() {
+        let grid = Arc::new(ContinuousHrtfGrid::new(&flat_model()));
+        let mut optimized = ContinuousBinaural::new(grid.clone(), [0.5, 1.0, 0.25]);
+        let mut reference = ContinuousBinaural::new(grid, [0.5, 1.0, 0.25]);
+        assert_eq!(
+            optimized.process(0.75).map(f32::to_bits),
+            reference.process(0.75).map(f32::to_bits)
+        );
+        let tail = optimized.tail_frames();
+        for frame in 0..tail + 128 {
+            if frame == tail / 2 {
+                optimized.set_direction([-0.75, 1.0, 0.5], 64);
+                reference.set_direction([-0.75, 1.0, 0.5], 64);
+            }
+            reference.active_tail = usize::MAX;
+            assert_eq!(
+                optimized.process(0.0).map(f32::to_bits),
+                reference.process(0.0).map(f32::to_bits),
+                "silent output changed at tail frame {frame}"
+            );
+        }
     }
 
     fn flat_model() -> ParametricHrtfModel {

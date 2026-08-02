@@ -35,19 +35,19 @@ pub enum OutputCodec {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum ObjectRendererMode {
-    /// Approved virtual-speaker renderer.
-    #[default]
+    /// Virtual-speaker route renderer.
     Baseline,
     /// Continuous object filters and source-relative early reflections.
+    #[default]
     Continuous,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum DistanceRendererMode {
-    /// Approved fixed sparse early field.
-    #[default]
+    /// Fixed sparse early field.
     Baseline,
     /// Constant-power direct sound plus source-relative image reflections.
+    #[default]
     ImageSource,
 }
 
@@ -189,12 +189,12 @@ mod tests {
     use super::{Cli, DistanceRendererMode, ObjectRendererMode, OutputCodec};
 
     #[test]
-    fn playback_calibrated_gain_is_the_default() {
+    fn playback_calibrated_processing_is_the_default() {
         let cli = Cli::try_parse_from(["surroundfold", "input.mkv"]).unwrap();
         assert!((cli.gain_db + 5.5).abs() < f64::EPSILON);
         assert_eq!(cli.output_codec, OutputCodec::Flac);
-        assert_eq!(cli.object_renderer, ObjectRendererMode::Baseline);
-        assert_eq!(cli.distance_renderer, DistanceRendererMode::Baseline);
+        assert_eq!(cli.object_renderer, ObjectRendererMode::Continuous);
+        assert_eq!(cli.distance_renderer, DistanceRendererMode::ImageSource);
         assert_eq!(cli.track_title, None);
         assert!(!cli.keep_existing_surroundfold);
     }

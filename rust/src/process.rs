@@ -27,14 +27,6 @@ pub struct ProcessOutput {
 }
 
 #[derive(Debug)]
-pub struct PipelineOutput {
-    pub producer_status: ExitStatus,
-    pub consumer_status: ExitStatus,
-    pub producer_stderr: Vec<u8>,
-    pub consumer_stderr: Vec<u8>,
-}
-
-#[derive(Debug)]
 pub struct StreamProcessOutput<T> {
     pub status: ExitStatus,
     pub value: T,
@@ -259,122 +251,6 @@ impl ProcessRunner {
             stderr,
         })
     }
-
-    /// Pipes one process directly into another while draining both error
-    /// streams and observing cancellation for both process groups.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when either child cannot start, stderr collection
-    /// fails, or cancellation is requested.
-    pub fn run_pipeline<I, S, J, T>(
-        &self,
-        producer_executable: &Path,
-        producer_args: I,
-        consumer_executable: &Path,
-        consumer_args: J,
-    ) -> Result<PipelineOutput, AppError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-        J: IntoIterator<Item = T>,
-        T: AsRef<OsStr>,
-    {
-        self.cancellation.check()?;
-
-        let mut producer_command = Command::new(producer_executable);
-        producer_command
-            .args(producer_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        producer_command.process_group(0);
-        let mut producer = producer_command.spawn().map_err(|source| AppError::File {
-            path: producer_executable.to_path_buf(),
-            source,
-        })?;
-        let producer_stdout = producer
-            .stdout
-            .take()
-            .ok_or_else(|| AppError::Dependency("could not pipe producer stdout".into()))?;
-        let producer_stderr = producer
-            .stderr
-            .take()
-            .ok_or_else(|| AppError::Dependency("could not capture producer stderr".into()))?;
-
-        let mut consumer_command = Command::new(consumer_executable);
-        consumer_command
-            .args(consumer_args)
-            .stdin(Stdio::from(producer_stdout))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        consumer_command.process_group(0);
-        let mut consumer = match consumer_command.spawn() {
-            Ok(child) => child,
-            Err(source) => {
-                terminate(&mut producer);
-                let _ = producer.wait();
-                return Err(AppError::File {
-                    path: consumer_executable.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        let consumer_stderr = consumer
-            .stderr
-            .take()
-            .ok_or_else(|| AppError::Dependency("could not capture consumer stderr".into()))?;
-        let producer_stderr_reader = thread::spawn(move || read_all(producer_stderr));
-        let consumer_stderr_reader = thread::spawn(move || read_all(consumer_stderr));
-
-        let mut producer_status = None;
-        let mut consumer_status = None;
-        while producer_status.is_none() || consumer_status.is_none() {
-            if self.cancellation.is_cancelled() {
-                terminate(&mut producer);
-                terminate(&mut consumer);
-                let _ = producer.wait();
-                let _ = consumer.wait();
-                let _ = producer_stderr_reader.join();
-                let _ = consumer_stderr_reader.join();
-                return Err(AppError::Cancelled);
-            }
-            if producer_status.is_none() {
-                producer_status = producer.try_wait()?;
-            }
-            if consumer_status.is_none() {
-                consumer_status = consumer.try_wait()?;
-            }
-            if producer_status.is_none() || consumer_status.is_none() {
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        let producer_stderr = producer_stderr_reader
-            .join()
-            .map_err(|_| AppError::Dependency("producer stderr reader panicked".into()))??;
-        let consumer_stderr = consumer_stderr_reader
-            .join()
-            .map_err(|_| AppError::Dependency("consumer stderr reader panicked".into()))??;
-        let Some(producer_status) = producer_status else {
-            return Err(AppError::Dependency(
-                "producer exited without a process status".into(),
-            ));
-        };
-        let Some(consumer_status) = consumer_status else {
-            return Err(AppError::Dependency(
-                "consumer exited without a process status".into(),
-            ));
-        };
-        Ok(PipelineOutput {
-            producer_status,
-            consumer_status,
-            producer_stderr,
-            consumer_stderr,
-        })
-    }
 }
 
 fn read_all(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
@@ -470,25 +346,5 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.value, b"streamed");
-    }
-
-    #[test]
-    fn pipes_one_process_into_another() {
-        let runner = ProcessRunner::new(Cancellation::new());
-        let printf = runner.locate_required("printf", None).unwrap();
-        let tee = runner.locate_required("tee", None).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let output_path = directory.path().join("piped.txt");
-        let output = runner
-            .run_pipeline(
-                &printf,
-                [OsStr::new("%s"), OsStr::new("piped")],
-                &tee,
-                [output_path.as_os_str()],
-            )
-            .unwrap();
-        assert!(output.producer_status.success());
-        assert!(output.consumer_status.success());
-        assert_eq!(std::fs::read(output_path).unwrap(), b"piped");
     }
 }

@@ -146,8 +146,6 @@ pub struct DecoderSubstreamState {
     pub coeff: [[[i32; 8]; 16]; 2],
     pub coeff_state: [[[i32; 8]; 16]; 2],
 
-    pub bypassed_lsb: [[i32; 16]; 160],
-    pub block_data: [[i32; 16]; 160],
     pub dither_table: [i32; 256],
     pub decoded_sample_len: usize,
 }
@@ -186,8 +184,6 @@ impl Default for DecoderSubstreamState {
             coeff: [[[0; 8]; 16]; 2],
             coeff_state: [[[0; 8]; 16]; 2],
 
-            bypassed_lsb: [[0; 16]; 160],
-            block_data: [[0; 16]; 160],
             dither_table: [0; 256],
             decoded_sample_len: 0,
         }
@@ -319,7 +315,7 @@ impl DecoderState {
 
             for block in substream_segment.block.iter() {
                 block.update_decoder_state(self)?;
-                self.decode()?;
+                self.decode(block)?;
             }
         }
 
@@ -375,7 +371,7 @@ impl DecoderState {
         }
     }
 
-    fn decode(&mut self) -> Result<()> {
+    fn decode(&mut self, block: &crate::structs::block::Block) -> Result<()> {
         let DecoderSubstreamState {
             restart_sync_word,
             min_chan,
@@ -407,7 +403,7 @@ impl DecoderState {
 
         let decoded_sample_len = &mut ss_state.decoded_sample_len;
         let dither_seed = &mut ss_state.dither_seed;
-        let bypassed_lsb = &mut ss_state.bypassed_lsb;
+        let bypassed_lsb = &block.bypassed_lsb;
         let coeff_state = &mut ss_state.coeff_state;
         let m_coeff = &mut ss_state.m_coeff;
 
@@ -419,7 +415,7 @@ impl DecoderState {
 
         // recorrelation
         {
-            let block_data = &ss_state.block_data;
+            let block_data = &block.block_data;
             let rematrix_buffer = &mut self.rematrix_buffer[*decoded_sample_len..];
 
             #[allow(clippy::needless_range_loop)]
@@ -488,7 +484,7 @@ impl DecoderState {
                 0x31EA => {
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let dither_seed_shr7 = *dither_seed >> 7;
 
                         rematrix_buffer[max_matrix_chan + 1] =
@@ -525,7 +521,7 @@ impl DecoderState {
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
@@ -564,7 +560,7 @@ impl DecoderState {
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {

@@ -2,6 +2,8 @@ use std::{collections::VecDeque, sync::Arc};
 
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::num_complex::Complex32;
+#[cfg(target_arch = "x86_64")]
+use wide::f32x8;
 
 use crate::error::AppError;
 
@@ -304,7 +306,7 @@ impl StereoConvolverBank {
             if !enabled[bus_index] {
                 continue;
             }
-            self.input.fill(0.0);
+            self.input[self.block_size..].fill(0.0);
             self.input[..self.block_size].copy_from_slice(&inputs[bus_index]);
             self.forward
                 .process_with_scratch(
@@ -411,6 +413,8 @@ pub struct PeakLimiter {
     attack_coefficient: f32,
     release_coefficient: f32,
     true_peak: TruePeakDetector,
+    safe_input_ceiling: f32,
+    unsafe_history_frames: usize,
     delayed: VecDeque<[f32; 2]>,
     peak_window: VecDeque<(u64, f32)>,
     frame_index: u64,
@@ -438,13 +442,19 @@ impl PeakLimiter {
             envelope_lookahead.saturating_add(TruePeakDetector::latency_frames());
         let attack_coefficient = 0.001_f32.powf(1.0 / envelope_lookahead as f32);
         let release_coefficient = (-1.0 / (Self::RELEASE_SECONDS * rate)).exp();
+        let ceiling = 10_f32.powf(Self::CEILING_DBFS / 20.0);
+        let safe_input_ceiling = ceiling
+            / (true_peak.maximum_absolute_coefficient_sum()
+                * (1.0 + TruePeakDetector::TAPS as f32 * f32::EPSILON));
         Self {
             gain: 1.0,
-            ceiling: 10_f32.powf(Self::CEILING_DBFS / 20.0),
+            ceiling,
             lookahead_frames,
             attack_coefficient,
             release_coefficient,
             true_peak,
+            safe_input_ceiling,
+            unsafe_history_frames: 0,
             delayed: VecDeque::with_capacity(lookahead_frames + 1),
             peak_window: VecDeque::with_capacity(lookahead_frames + 1),
             frame_index: 0,
@@ -455,24 +465,50 @@ impl PeakLimiter {
     ///
     /// The returned block can be shorter than the input while the lookahead
     /// fills. Feeding the same number of zero frames drains the delayed audio.
+    #[allow(clippy::float_cmp)] // The fast path is valid only at exact unity gain.
     pub fn process(&mut self, interleaved_stereo: &[f32], output: &mut Vec<f32>) {
         debug_assert_eq!(interleaved_stereo.len() % 2, 0);
         output.clear();
         output.reserve(interleaved_stereo.len());
+        if self.gain == 1.0
+            && self.peak_window.is_empty()
+            && self.unsafe_history_frames == 0
+            && interleaved_stereo
+                .iter()
+                .all(|sample| sample.abs() <= self.safe_input_ceiling)
+        {
+            for frame in interleaved_stereo.chunks_exact(2) {
+                let stereo_frame = [frame[0], frame[1]];
+                self.true_peak.push_history(stereo_frame);
+                self.delayed.push_back(stereo_frame);
+                if self.delayed.len() > self.lookahead_frames
+                    && let Some(delayed) = self.delayed.pop_front()
+                {
+                    output.extend_from_slice(&delayed);
+                }
+                self.frame_index = self.frame_index.saturating_add(1);
+            }
+            return;
+        }
         for frame in interleaved_stereo.chunks_exact(2) {
             let stereo_frame = [frame[0], frame[1]];
-            let peak = frame[0]
-                .abs()
-                .max(frame[1].abs())
-                .max(self.true_peak.push(stereo_frame));
-            while self
-                .peak_window
-                .back()
-                .is_some_and(|(_, previous)| *previous <= peak)
-            {
-                self.peak_window.pop_back();
+            let sample_peak = frame[0].abs().max(frame[1].abs());
+            if sample_peak > self.safe_input_ceiling {
+                self.unsafe_history_frames = TruePeakDetector::TAPS;
+            } else {
+                self.unsafe_history_frames = self.unsafe_history_frames.saturating_sub(1);
             }
-            self.peak_window.push_back((self.frame_index, peak));
+            let peak = sample_peak.max(self.true_peak.push(stereo_frame));
+            if peak > self.ceiling {
+                while self
+                    .peak_window
+                    .back()
+                    .is_some_and(|(_, previous)| *previous <= peak)
+                {
+                    self.peak_window.pop_back();
+                }
+                self.peak_window.push_back((self.frame_index, peak));
+            }
             let oldest = self
                 .frame_index
                 .saturating_sub(u64::try_from(self.lookahead_frames).unwrap_or(u64::MAX));
@@ -524,7 +560,10 @@ impl PeakLimiter {
 /// by the limiter's existing lookahead.
 #[derive(Clone, Debug)]
 struct TruePeakDetector {
-    history: VecDeque<[f32; 2]>,
+    history_left: [f32; Self::TAPS * 2],
+    history_right: [f32; Self::TAPS * 2],
+    cursor: usize,
+    filled: usize,
     coefficients: [[f32; Self::TAPS]; 3],
 }
 
@@ -535,7 +574,10 @@ impl TruePeakDetector {
 
     fn new() -> Self {
         Self {
-            history: VecDeque::with_capacity(Self::TAPS),
+            history_left: [0.0; Self::TAPS * 2],
+            history_right: [0.0; Self::TAPS * 2],
+            cursor: 0,
+            filled: 0,
             coefficients: Self::PHASES.map(interpolation_coefficients),
         }
     }
@@ -545,28 +587,74 @@ impl TruePeakDetector {
     }
 
     fn push(&mut self, frame: [f32; 2]) -> f32 {
-        self.history.push_back(frame);
-        if self.history.len() < Self::TAPS {
+        if !self.push_history(frame) {
             return 0.0;
-        }
-        if self.history.len() > Self::TAPS {
-            self.history.pop_front();
         }
 
         let mut peak = 0.0_f32;
+        let history_left = &self.history_left[self.cursor..self.cursor + Self::TAPS];
+        let history_right = &self.history_right[self.cursor..self.cursor + Self::TAPS];
         for coefficients in &self.coefficients {
-            for ear in 0..2 {
-                let sample = self
-                    .history
-                    .iter()
-                    .zip(coefficients)
-                    .map(|(frame, coefficient)| frame[ear] * coefficient)
-                    .sum::<f32>();
-                peak = peak.max(sample.abs());
-            }
+            let [left, right] = true_peak_stereo_dot(history_left, history_right, coefficients);
+            peak = peak.max(left.abs()).max(right.abs());
         }
         peak
     }
+
+    fn push_history(&mut self, frame: [f32; 2]) -> bool {
+        self.history_left[self.cursor] = frame[0];
+        self.history_left[self.cursor + Self::TAPS] = frame[0];
+        self.history_right[self.cursor] = frame[1];
+        self.history_right[self.cursor + Self::TAPS] = frame[1];
+        self.cursor += 1;
+        if self.cursor == Self::TAPS {
+            self.cursor = 0;
+        }
+        self.filled = self.filled.saturating_add(1).min(Self::TAPS);
+        if self.filled < Self::TAPS {
+            return false;
+        }
+        true
+    }
+
+    fn maximum_absolute_coefficient_sum(&self) -> f32 {
+        self.coefficients
+            .iter()
+            .map(|phase| phase.iter().map(|coefficient| coefficient.abs()).sum())
+            .fold(0.0, f32::max)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn true_peak_stereo_dot(left: &[f32], right: &[f32], coefficients: &[f32]) -> [f32; 2] {
+    let mut output = [0.0; 2];
+    for ((left, right), coefficient) in left.iter().zip(right).zip(coefficients) {
+        output[0] += left * coefficient;
+        output[1] += right * coefficient;
+    }
+    output
+}
+
+#[cfg(target_arch = "x86_64")]
+fn true_peak_stereo_dot(left: &[f32], right: &[f32], coefficients: &[f32]) -> [f32; 2] {
+    let mut left_sum = [f32x8::ZERO; 3];
+    let mut right_sum = [f32x8::ZERO; 3];
+    for (chunk, tap) in (0..TruePeakDetector::TAPS).step_by(8).enumerate() {
+        let end = tap + 8;
+        let left = f32x8::new(left[tap..end].try_into().expect("eight left samples"));
+        let right = f32x8::new(right[tap..end].try_into().expect("eight right samples"));
+        let coefficients = f32x8::new(
+            coefficients[tap..end]
+                .try_into()
+                .expect("eight true-peak taps"),
+        );
+        left_sum[chunk] = left * coefficients;
+        right_sum[chunk] = right * coefficients;
+    }
+    [
+        ((left_sum[0] + left_sum[1]) + left_sum[2]).reduce_add(),
+        ((right_sum[0] + right_sum[1]) + right_sum[2]).reduce_add(),
+    ]
 }
 
 #[allow(clippy::cast_precision_loss)] // The fixed 24-tap index is exactly represented.

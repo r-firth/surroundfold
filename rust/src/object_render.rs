@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
     binaural::BinauralWriter,
@@ -49,10 +46,10 @@ pub(crate) struct ObjectRenderer<'a> {
     panner: SpatialPanner,
     continuous_grid: Option<Arc<ContinuousHrtfGrid>>,
     isf: Option<IsfRenderer>,
-    isf_sources: HashMap<usize, MovingGains>,
-    objects: HashMap<usize, MovingSpatialObject>,
+    isf_sources: Vec<Option<MovingGains>>,
+    objects: Vec<Option<MovingSpatialObject>>,
     retired_objects: Vec<RetiredObject>,
-    object_channels: HashSet<usize>,
+    object_channels: Vec<bool>,
     pending: VecDeque<ScheduledUpdate>,
     sample_position: u64,
     sample_rate: Option<u32>,
@@ -82,10 +79,10 @@ impl<'a> ObjectRenderer<'a> {
             panner,
             continuous_grid,
             isf: None,
-            isf_sources: HashMap::new(),
-            objects: HashMap::new(),
+            isf_sources: Vec::new(),
+            objects: Vec::new(),
             retired_objects: Vec::new(),
-            object_channels: HashSet::new(),
+            object_channels: Vec::new(),
             pending: VecDeque::new(),
             sample_position: 0,
             sample_rate: None,
@@ -147,34 +144,40 @@ impl<'a> ObjectRenderer<'a> {
             samples,
             channel_speakers,
         )?;
+        self.ensure_channel_capacity(channel_count);
         self.configure_isf(isf, channel_count)?;
         for source in samples.chunks_exact(channel_count) {
             self.apply_due_updates()?;
             self.render_retired_objects()?;
             for (channel, sample) in source.iter().copied().enumerate() {
-                if let Some(object) = self.objects.get_mut(&channel) {
+                if let Some(object) = self.objects[channel].as_mut() {
                     object.render(sample, &mut self.writer)?;
-                } else if let Some(source) = self.isf_sources.get(&channel) {
-                    for (bus, gain) in source.current.iter().copied().enumerate() {
-                        if gain != 0.0 {
-                            let routed = sample * gain;
-                            self.writer.add(bus, routed)?;
-                            self.writer
-                                .add_early_reflection(bus, routed * UNSPECIFIED_REFLECTION_RATIO)?;
+                } else if let Some(source) = self.isf_sources[channel].as_ref() {
+                    if sample != 0.0 {
+                        for (bus, gain) in source.current.iter().copied().enumerate() {
+                            if gain != 0.0 {
+                                let routed = sample * gain;
+                                self.writer.add(bus, routed)?;
+                                self.writer.add_early_reflection(
+                                    bus,
+                                    routed * UNSPECIFIED_REFLECTION_RATIO,
+                                )?;
+                            }
                         }
                     }
-                } else if !self.object_channels.contains(&channel)
+                } else if !self.object_channels[channel]
                     && !self.options.mute_bed
+                    && sample != 0.0
                     && let Some(speaker) = channel_speakers[channel]
                 {
                     self.render_bed_sample(speaker, sample)?;
                 }
             }
             self.writer.end_frame()?;
-            for source in self.isf_sources.values_mut() {
+            for source in self.isf_sources.iter_mut().flatten() {
                 source.advance();
             }
-            for object in self.objects.values_mut() {
+            for object in self.objects.iter_mut().flatten() {
                 object.advance(&self.panner)?;
             }
             self.sample_position = self
@@ -221,18 +224,17 @@ impl<'a> ObjectRenderer<'a> {
             self.options.mute_ground,
         )?;
         for source_channel in config.start_channel..end {
-            if let Some(object) = self.objects.remove(&source_channel) {
+            if let Some(object) = self.objects[source_channel].take() {
                 self.retire_object(object);
             }
-            self.object_channels.insert(source_channel);
+            self.object_channels[source_channel] = true;
             let target = renderer.gains(
                 source_channel,
                 true,
                 1.0,
                 crate::object::ObjectTrim::default(),
             )?;
-            self.isf_sources
-                .insert(source_channel, MovingGains::new(target));
+            self.isf_sources[source_channel] = Some(MovingGains::new(target));
         }
         self.isf = Some(renderer);
         Ok(())
@@ -321,17 +323,32 @@ impl<'a> ObjectRenderer<'a> {
     }
 
     fn apply_update(&mut self, update: SpatialUpdate) -> Result<(), AppError> {
+        let referenced_channels = update
+            .objects
+            .iter()
+            .map(|state| state.source_channel)
+            .chain(update.isf.iter().map(|state| state.source_channel));
+        if update.bed_speakers.len() > self.objects.len()
+            || referenced_channels
+                .into_iter()
+                .any(|channel| channel >= self.objects.len())
+        {
+            return Err(AppError::Render(format!(
+                "object metadata references channels outside the decoded {}-channel stream",
+                self.objects.len()
+            )));
+        }
         for source_channel in 0..update.bed_speakers.len() {
             let has_object_metadata = update
                 .objects
                 .iter()
                 .any(|state| state.source_channel == source_channel);
             if !has_object_metadata {
-                if let Some(object) = self.objects.remove(&source_channel) {
+                if let Some(object) = self.objects[source_channel].take() {
                     self.retire_object(object);
                 }
-                if !self.isf_sources.contains_key(&source_channel) {
-                    self.object_channels.remove(&source_channel);
+                if self.isf_sources[source_channel].is_none() {
+                    self.object_channels[source_channel] = false;
                 }
             }
         }
@@ -342,7 +359,8 @@ impl<'a> ObjectRenderer<'a> {
             let target =
                 renderer.gains(state.source_channel, state.active, state.gain, state.trim)?;
             self.isf_sources
-                .get_mut(&state.source_channel)
+                .get_mut(state.source_channel)
+                .and_then(Option::as_mut)
                 .ok_or_else(|| {
                     AppError::Render(format!(
                         "ISF metadata references unconfigured channel {}",
@@ -352,27 +370,33 @@ impl<'a> ObjectRenderer<'a> {
                 .set_target(target, update.ramp_samples);
         }
         for state in update.objects {
-            self.object_channels.insert(state.source_channel);
+            let source_channel = state.source_channel;
+            self.object_channels[source_channel] = true;
             let target = RenderableObject::new(&state, self.options);
-            match self.objects.get_mut(&state.source_channel) {
+            match self.objects[source_channel].as_mut() {
                 Some(object) => {
                     object.set_target(target, update.ramp_samples, &self.panner)?;
                 }
                 None => {
-                    self.objects.insert(
-                        state.source_channel,
-                        MovingSpatialObject::new(
-                            target,
-                            &self.panner,
-                            self.continuous_grid.clone(),
-                            self.options.distance_renderer,
-                            self.hrir.sample_rate,
-                        )?,
-                    );
+                    self.objects[source_channel] = Some(MovingSpatialObject::new(
+                        target,
+                        &self.panner,
+                        self.continuous_grid.clone(),
+                        self.options.distance_renderer,
+                        self.hrir.sample_rate,
+                    )?);
                 }
             }
         }
         Ok(())
+    }
+
+    fn ensure_channel_capacity(&mut self, channel_count: usize) {
+        if self.objects.len() < channel_count {
+            self.objects.resize_with(channel_count, || None);
+            self.isf_sources.resize_with(channel_count, || None);
+            self.object_channels.resize(channel_count, false);
+        }
     }
 
     fn retire_object(&mut self, object: MovingSpatialObject) {
@@ -396,7 +420,8 @@ impl<'a> ObjectRenderer<'a> {
     pub(crate) fn finish(mut self) -> Result<RenderResult, AppError> {
         let active_tail = self
             .objects
-            .values()
+            .iter()
+            .flatten()
             .map(MovingSpatialObject::tail_frames)
             .max()
             .unwrap_or(0);
@@ -408,7 +433,7 @@ impl<'a> ObjectRenderer<'a> {
             .unwrap_or(0);
         let tail_frames = active_tail.max(retired_tail);
         for _ in 0..tail_frames {
-            for object in self.objects.values_mut() {
+            for object in self.objects.iter_mut().flatten() {
                 object.render_tail(&mut self.writer)?;
             }
             self.render_retired_objects()?;
@@ -435,6 +460,7 @@ struct MovingGains {
     step: Vec<f32>,
     level: f32,
     level_step: f32,
+    moving: bool,
     remaining: usize,
 }
 
@@ -448,6 +474,7 @@ impl MovingGains {
             target,
             level,
             level_step: 0.0,
+            moving: false,
             remaining: 0,
         }
     }
@@ -461,6 +488,7 @@ impl MovingGains {
             self.step.fill(0.0);
             self.level = vector_level(&self.target);
             self.level_step = 0.0;
+            self.moving = false;
             self.remaining = 0;
             return;
         }
@@ -471,6 +499,7 @@ impl MovingGains {
         }
         self.level = vector_level(&self.current);
         self.level_step = (vector_level(&self.target) - self.level) / duration;
+        self.moving = self.step.iter().any(|step| *step != 0.0) || self.level_step != 0.0;
         self.remaining = ramp_samples;
     }
 
@@ -478,23 +507,36 @@ impl MovingGains {
         if self.remaining == 0 {
             return;
         }
-        for (linear, step) in self.linear.iter_mut().zip(&self.step) {
-            *linear += *step;
-        }
-        self.current.clone_from(&self.linear);
-        self.level += self.level_step;
-        self.remaining -= 1;
-        if self.remaining == 0 {
+        if self.remaining == 1 {
             self.current.clone_from(&self.target);
             self.linear.clone_from(&self.target);
             self.level = vector_level(&self.target);
-        } else {
-            let interpolated_level = vector_level(&self.current);
-            if interpolated_level > f32::EPSILON {
-                let scale = self.level / interpolated_level;
-                for gain in &mut self.current {
-                    *gain *= scale;
-                }
+            self.moving = false;
+            self.remaining = 0;
+            return;
+        }
+        if !self.moving {
+            self.remaining -= 1;
+            return;
+        }
+        let mut squared_level = 0.0;
+        for ((linear, current), step) in self
+            .linear
+            .iter_mut()
+            .zip(&mut self.current)
+            .zip(&self.step)
+        {
+            *linear += *step;
+            *current = *linear;
+            squared_level += *current * *current;
+        }
+        self.level += self.level_step;
+        self.remaining -= 1;
+        let interpolated_level = squared_level.sqrt();
+        if interpolated_level > f32::EPSILON {
+            let scale = self.level / interpolated_level;
+            for gain in &mut self.current {
+                *gain *= scale;
             }
         }
     }
@@ -1198,9 +1240,14 @@ impl MovingSpatialObject {
         let direct_gain = self.state.distance_direct;
         if let Some(continuous) = self.continuous.as_mut() {
             let continuous_weight = self.state.continuous_weight.clamp(0.0, 1.0);
-            let baseline_weight = (1.0 - continuous_weight).sqrt();
-            let continuous_weight = continuous_weight.sqrt();
-            if baseline_weight > f32::EPSILON {
+            let (baseline_weight, continuous_weight) = if continuous_weight == 0.0 {
+                (1.0, 0.0)
+            } else if continuous_weight >= 1.0 {
+                (0.0, 1.0)
+            } else {
+                ((1.0 - continuous_weight).sqrt(), continuous_weight.sqrt())
+            };
+            if sample != 0.0 && baseline_weight > f32::EPSILON {
                 for (bus, gain) in self.gains.current.iter().copied().enumerate() {
                     if gain != 0.0 {
                         writer.add(bus, sample * gain * baseline_weight * direct_gain)?;
@@ -1231,7 +1278,7 @@ impl MovingSpatialObject {
         if drop_early_distance {
             self.early_distance = None;
         }
-        if self.state.reflection_ratio != 0.0 {
+        if sample != 0.0 && self.state.reflection_ratio != 0.0 {
             for (bus, gain) in self.gains.current.iter().copied().enumerate() {
                 if gain != 0.0 {
                     writer
@@ -2069,6 +2116,7 @@ mod tests {
             },
         )
         .unwrap();
+        renderer.ensure_channel_capacity(1);
         renderer
             .apply_update(SpatialUpdate {
                 sample_offset: 0,
@@ -2091,8 +2139,8 @@ mod tests {
                 }],
             })
             .unwrap();
-        assert!(renderer.objects.contains_key(&0));
-        assert!(renderer.object_channels.contains(&0));
+        assert!(renderer.objects[0].is_some());
+        assert!(renderer.object_channels[0]);
 
         renderer
             .apply_update(SpatialUpdate {
@@ -2104,8 +2152,8 @@ mod tests {
             })
             .unwrap();
 
-        assert!(!renderer.objects.contains_key(&0));
-        assert!(!renderer.object_channels.contains(&0));
+        assert!(renderer.objects[0].is_none());
+        assert!(!renderer.object_channels[0]);
     }
 
     #[test]

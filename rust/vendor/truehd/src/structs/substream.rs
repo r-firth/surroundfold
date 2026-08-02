@@ -126,7 +126,7 @@ pub struct Terminator {
 /// Contains compressed audio data for one substream with optional error protection.
 #[derive(Debug, Default)]
 pub struct SubstreamSegment {
-    pub block: Vec<Block>,
+    pub block: Vec<Box<Block>>,
     pub substream_parity: u8,
     pub substream_crc: u8,
     pub terminator: Option<Terminator>,
@@ -146,7 +146,13 @@ impl SubstreamSegment {
             );
         }
 
-        let mut ss = Self::default();
+        // A segment normally contains at most five blocks. Reserving them up
+        // front avoids repeatedly copying Block's two large PCM work arrays as
+        // the vector grows from one element at a time.
+        let mut ss = Self {
+            block: Vec::with_capacity(5),
+            ..Self::default()
+        };
         let mut last_block_in_segment = false;
         state.substream_state_mut()?.block_index = 0;
 
