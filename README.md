@@ -22,6 +22,20 @@ built on a Mac with:
 scripts/publish-all.sh
 ```
 
+On a Linux media server whose CPU supports the x86-64-v3 feature level, an
+explicitly tuned build can be substantially faster than the portable x86-64
+binary:
+
+```bash
+CARGO_ENCODED_RUSTFLAGS='-Ctarget-cpu=x86-64-v3' \
+  cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu
+```
+
+Tagged releases provide a universal Apple Silicon and Intel macOS package and
+a statically linked, portable Linux x86-64 package on the
+[GitHub releases page](https://github.com/r-firth/surroundfold/releases).
+Both packages require `ffmpeg` and `ffprobe` on `PATH` at runtime.
+
 ## Use
 
 ```bash
@@ -89,8 +103,8 @@ high-frequency absorption follow each source. Reflection timing uses the same
 bandlimited fractional delay as moving ITD. The model has no late-reverb stage
 and keeps every reflection arrival inside 80 milliseconds; filter decay is
 scaled with sample rate so high-rate renders are not truncated above the
-24-bit floor. Both new architectures are opt-in while listening evaluation is
-in progress.
+24-bit floor. Continuous object rendering and image-source distance rendering
+are the defaults; the baseline modes remain available for direct comparison.
 
 The single appended track receives a fixed common-left/right finishing curve:
 +0.8 dB from a broad bell centred at 55 Hz, -0.8 dB around 240 Hz, and a
@@ -108,8 +122,8 @@ processing.
 | `--gain-db NUMBER` | `-5.5` | Gain before the output limiter |
 | `--surround-swap on\|off` | `off` | Exchange side and rear surround routes |
 | `--speaker-virtualizer on\|off` | `off` | Direct stereo fold-down for ground beds, bypassing their HRIRs |
-| `--object-renderer baseline\|continuous` | `baseline` | Approved route renderer or continuous point-object filters |
-| `--distance-renderer baseline\|image-source` | `baseline` | Fixed early field or source-relative first-order reflections |
+| `--object-renderer baseline\|continuous` | `continuous` | Virtual-speaker routes or continuous point-object filters |
+| `--distance-renderer baseline\|image-source` | `image-source` | Fixed early field or source-relative first-order reflections |
 | `--mute-bed on\|off` | `off` | Mute reference bed sources |
 | `--mute-ground on\|off` | `off` | Mute ground-plane sources |
 | `--room-correction PATH` | off | Apply a stereo room-correction FIR after binaural rendering |
@@ -129,6 +143,11 @@ rejected for native object tracks rather than silently ignored.
 Run `surroundfold --help` for path, progress, temporary-file, overwrite, and
 advanced mux options.
 
+Text progress reports render and mux percentage, real-time speed, and ETA every
+five seconds. `--progress quiet` suppresses those updates, while
+`--progress json` keeps standard output machine-readable and includes final
+phase timings.
+
 ## What the renderer preserves
 
 The input is opened read-only. The replacement maps every source stream,
@@ -141,13 +160,14 @@ with FFmpeg's fast search mode for players that need a compatibility track.
 The appended track is always non-default. Running SurroundFold again replaces
 its earlier output instead of accumulating duplicate tracks.
 
-The preservation mux is streamed in two stages. The approved finishing filter
-has already run inside the Rust renderer; the lightweight FLAC or optional AAC
-encode runs in the first mux stage while video and original audio are copied
-and interleaved. Sparse subtitles, data, and attachments are copied back in
-the second stage. This prevents PGS subtitle gaps from leaving appended audio
-packets hundreds of megabytes apart, which can starve real-time hardware
-demuxers even when an offline decoder accepts the file.
+The preservation mux runs in one FFmpeg pass. The approved finishing filter has
+already run inside the Rust renderer; only the lightweight FLAC or optional AAC
+delivery track is encoded, while every original packet is copied. Video,
+original audio, and the appended track are mapped before sparse subtitles,
+data, and attachments so FFmpeg's bounded interleaver writes the new audio at
+hardware-friendly intervals. The generated 16-stream PGS fixture verifies both
+the first packet position and the maximum physical gap between appended audio
+packets.
 
 Before publishing the output, the program probes the partial file and verifies:
 
@@ -187,9 +207,9 @@ latency is removed so the appended track remains aligned with the source.
 TrueHD and DD+/Atmos beds and objects share calibrated binaural LFE routing,
 parametric ITD/ILD panning with bounded measured direction shapes,
 metadata-space movement interpolation, and linked 4×-oversampled true-peak
-control. The approved distance renderer retains authored OAMD distance
+control. The baseline distance renderer retains authored OAMD distance
 separately from direction and feeds four fixed arrivals between roughly 7 and
-34 milliseconds. The opt-in image-source renderer instead uses the authored
+34 milliseconds. The default image-source renderer instead uses the authored
 distance to balance direct and early energy while moving six first-order
 arrivals with the object. Neither path adds late reverb.
 
@@ -218,9 +238,9 @@ the approved compatibility settings. A synthetic high-bitrate fixture with
 sixteen sparse PGS streams also checks the physical spacing of appended FLAC
 packets, not merely whether FFmpeg can decode them afterward.
 
-The small Apache-2.0 TrueHD decoder dependency is pinned in
-`rust/vendor/truehd`; its focused regression tests cover local metadata
-correctness fixes that are not yet available in its published crate.
+The TrueHD decoder dependency is pinned in `rust/vendor/truehd`; its focused
+regression tests cover local metadata correctness fixes that are not yet
+available in its published crate.
 
 Real codec samples stay outside the repository. Optional regression fixtures
 are enabled with:
@@ -238,8 +258,23 @@ reconstruction matrices and object counts, performs the full QMF/object render,
 and verifies the preserved Matroska output is non-silent.
 
 CI runs formatting, strict Clippy, both feature configurations, generated
-end-to-end renders, release builds, smoke tests, dependency-source policy,
-license policy, and RustSec advisory checks on Apple Silicon and Intel macOS.
+end-to-end renders, release builds, and smoke tests on Apple Silicon, Intel
+macOS, and portable static Linux x86-64.
+
+## Releasing
+
+Use conventional commit messages (`feat:`, `fix:`, and so on), then run the
+`release` workflow from the Actions page when the next release is ready.
+Commitizen derives the semantic version from commits since the previous tag;
+there are no version files or tags to edit manually.
+
+The first run publishes the existing `0.1.0`. Later runs atomically update the
+Cargo workspace version, `Cargo.lock`, and `CHANGELOG.md`, then commit and tag
+that bump. The workflow reruns the full quality gate, builds and smoke-tests
+both macOS architectures plus static Linux x86-64, creates the ad-hoc-signed
+universal macOS executable, publishes both versioned archives and SHA-256
+checksums, and uses the generated changelog section as the GitHub release
+notes.
 
 ## Current boundaries
 
@@ -251,9 +286,9 @@ license policy, and RustSec advisory checks on Apple Silicon and Intel macOS.
   downmix configurations defined there.
 - The bundled 7.1 profile has no measured overhead responses. Supply a measured
   SOFA profile for genuine individualized elevation cues.
-- The default SOFA object renderer uses its established 66-direction virtual
-  array. The experimental continuous renderer bypasses that array for point
-  objects and preserves their authored elevation independently of the array;
-  speaker-anchored and deliberately extended objects still use it.
+- The default continuous renderer bypasses the profile's 66-direction virtual
+  array for point objects and preserves their authored elevation independently
+  of the array. Speaker-anchored and deliberately extended objects still use
+  the array, and `--object-renderer baseline` restores it for all objects.
 - Live playback and hardware bitstream output are outside this offline
   stereo-renderer's scope.

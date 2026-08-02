@@ -1,0 +1,318 @@
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  bump:
+    name: Bump version and create tag
+    runs-on: macos-15
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Commitizen
+        run: python -m pip install commitizen==4.17.0
+
+      - id: bump
+        name: Select version, update changelog, and tag
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          head_tag="$(git tag --points-at HEAD --list 'v*' --sort=-version:refname | sed -n '1p')"
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | sed -n '1p')"
+          if [[ -n "$head_tag" ]] && ! gh release view "$head_tag" >/dev/null 2>&1; then
+            tag="$head_tag"
+            echo "resuming unfinished release $tag"
+          elif [[ -z "$latest_tag" ]]; then
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "surroundfold") | .version')"
+            tag="v$version"
+            if ! grep -Eq "^## $tag( |$)" CHANGELOG.md; then
+              echo "CHANGELOG.md has no entry for initial release $tag" >&2
+              exit 1
+            fi
+            git tag -a "$tag" -m "SurroundFold $version"
+            git push origin "$tag"
+          else
+            cz bump --yes
+            tag="$(git describe --tags --exact-match)"
+            git push origin "HEAD:$DEFAULT_BRANCH" "$tag"
+          fi
+
+          version="${tag#v}"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "surroundfold") | .version')"
+          if [[ "$version" != "$package_version" ]]; then
+            echo "tag '$tag' does not match package version '$package_version'" >&2
+            exit 1
+          fi
+          if ! grep -Eq "^## $tag( |$)" CHANGELOG.md; then
+            echo "CHANGELOG.md has no entry for $tag" >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "version bump left uncommitted files" >&2
+            git status --short >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Release quality gate
+    needs: bump
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Install Rust 1.88
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.88.0 --component clippy,rustfmt
+          rustup default 1.88.0
+
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint both feature configurations
+        run: |
+          cargo clippy -p surroundfold --all-targets --locked --no-deps -- -D warnings
+          cargo clippy -p surroundfold --all-targets --locked --no-default-features --no-deps -- -D warnings
+
+      - name: Test both feature configurations
+        run: |
+          cargo test --workspace --all-targets --locked
+          cargo test --workspace --all-targets --locked --no-default-features
+
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    needs: bump
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Install Rust 1.88
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.88.0
+          rustup default 1.88.0
+
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+
+      - name: Build release executable
+        run: |
+          flag_separator=$'\x1f'
+          remap_flags="--remap-path-prefix=$HOME=/build${flag_separator}--remap-path-prefix=$GITHUB_WORKSPACE=/source"
+          CARGO_ENCODED_RUSTFLAGS="$remap_flags" \
+            cargo build --workspace --release --locked
+
+      - name: Smoke release executable
+        run: scripts/smoke-published.sh target/release/surroundfold
+
+      - name: Stage native executable
+        run: |
+          mkdir -p "release-${{ matrix.arch }}"
+          cp target/release/surroundfold "release-${{ matrix.arch }}/surroundfold"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-binary-${{ matrix.arch }}
+          path: release-${{ matrix.arch }}/surroundfold
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Build Linux x86_64
+    needs: bump
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Install Rust 1.88
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
+          rustup default 1.88.0
+
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install build and runtime dependencies
+        run: |
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Build portable static executable
+        run: |
+          flag_separator=$'\x1f'
+          remap_flags="--remap-path-prefix=$HOME=/build${flag_separator}--remap-path-prefix=$GITHUB_WORKSPACE=/source"
+          CARGO_ENCODED_RUSTFLAGS="$remap_flags" \
+            cargo zigbuild --workspace --release --locked \
+              --target x86_64-unknown-linux-musl
+
+      - name: Verify and smoke executable
+        run: |
+          executable=target/x86_64-unknown-linux-musl/release/surroundfold
+          if readelf -l "$executable" | grep -q 'Requesting program interpreter'; then
+            echo "Linux release executable is dynamically linked" >&2
+            exit 1
+          fi
+          scripts/smoke-published.sh "$executable"
+
+      - name: Stage Linux executable
+        run: |
+          mkdir -p release-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/surroundfold \
+            release-linux-x86_64/surroundfold
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-binary-linux-x86_64
+          path: release-linux-x86_64/surroundfold
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [bump, quality, build, linux]
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-binary-arm64
+          path: inputs/arm64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-binary-x86_64
+          path: inputs/x86_64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-binary-linux-x86_64
+          path: inputs/linux-x86_64
+
+      - id: package
+        name: Assemble release packages
+        env:
+          VERSION: ${{ needs.bump.outputs.version }}
+        run: |
+          macos_package_name="surroundfold-$VERSION-macos-universal"
+          macos_package_dir="dist/$macos_package_name"
+          macos_archive="$macos_package_name.tar.gz"
+          linux_package_name="surroundfold-$VERSION-linux-x86_64"
+          linux_package_dir="dist/$linux_package_name"
+          linux_archive="$linux_package_name.tar.gz"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+
+          mkdir -p "$macos_package_dir" "$linux_package_dir"
+          lipo -create \
+            inputs/arm64/surroundfold \
+            inputs/x86_64/surroundfold \
+            -output "$macos_package_dir/surroundfold"
+          lipo "$macos_package_dir/surroundfold" -verify_arch arm64 x86_64
+          chmod 755 "$macos_package_dir/surroundfold"
+          codesign --force --sign - "$macos_package_dir/surroundfold"
+          codesign --verify --strict "$macos_package_dir/surroundfold"
+          cp inputs/linux-x86_64/surroundfold "$linux_package_dir/surroundfold"
+          chmod 755 "$linux_package_dir/surroundfold"
+          cp README.md CHANGELOG.md "$macos_package_dir/"
+          cp README.md CHANGELOG.md "$linux_package_dir/"
+
+          tar -C dist -czf "dist/$macos_archive" "$macos_package_name"
+          tar -C dist -czf "dist/$linux_archive" "$linux_package_name"
+          (cd dist && shasum -a 256 "$macos_archive" > "$macos_archive.sha256")
+          (cd dist && shasum -a 256 "$linux_archive" > "$linux_archive.sha256")
+
+          awk -v version="v$VERSION" '
+            index($0, "## " version) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > "$notes_file"
+          if ! grep -q '[^[:space:]]' "$notes_file"; then
+            echo "changelog entry for $VERSION is empty" >&2
+            exit 1
+          fi
+
+          echo "macos_archive=$macos_archive" >> "$GITHUB_OUTPUT"
+          echo "linux_archive=$linux_archive" >> "$GITHUB_OUTPUT"
+          echo "notes=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.bump.outputs.version }}
+          TAG: ${{ needs.bump.outputs.tag }}
+          MACOS_ARCHIVE: ${{ steps.package.outputs.macos_archive }}
+          LINUX_ARCHIVE: ${{ steps.package.outputs.linux_archive }}
+          NOTES_FILE: ${{ steps.package.outputs.notes }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist/$MACOS_ARCHIVE" "dist/$MACOS_ARCHIVE.sha256" \
+              "dist/$LINUX_ARCHIVE" "dist/$LINUX_ARCHIVE.sha256" \
+              --clobber
+            gh release edit "$TAG" \
+              --title "SurroundFold $VERSION" \
+              --notes-file "$NOTES_FILE"
+          else
+            gh release create "$TAG" \
+              "dist/$MACOS_ARCHIVE" "dist/$MACOS_ARCHIVE.sha256" \
+              "dist/$LINUX_ARCHIVE" "dist/$LINUX_ARCHIVE.sha256" \
+              --verify-tag \
+              --title "SurroundFold $VERSION" \
+              --notes-file "$NOTES_FILE"
+          fi

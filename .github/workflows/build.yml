@@ -3,6 +3,7 @@ name: build-and-test
 on:
   workflow_dispatch:
   push:
+    branches: ["**"]
   pull_request:
 
 permissions:
@@ -25,7 +26,7 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.88
         run: |
@@ -72,8 +73,61 @@ jobs:
           cp target/release/surroundfold "$package/surroundfold"
           cp README.md "$package/"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: surroundfold-macos-${{ matrix.arch }}
           path: target/release/surroundfold-macos-${{ matrix.arch }}
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.88
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
+          rustup default 1.88.0
+
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install build and runtime dependencies
+        run: |
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Build portable static executable
+        run: |
+          flag_separator=$'\x1f'
+          remap_flags="--remap-path-prefix=$HOME=/build${flag_separator}--remap-path-prefix=$GITHUB_WORKSPACE=/source"
+          CARGO_ENCODED_RUSTFLAGS="$remap_flags" \
+            cargo zigbuild --workspace --release --locked \
+              --target x86_64-unknown-linux-musl
+
+      - name: Verify and smoke executable
+        run: |
+          executable=target/x86_64-unknown-linux-musl/release/surroundfold
+          if readelf -l "$executable" | grep -q 'Requesting program interpreter'; then
+            echo "Linux release executable is dynamically linked" >&2
+            exit 1
+          fi
+          scripts/smoke-published.sh "$executable"
+
+      - name: Assemble release artifact
+        run: |
+          package=target/release/surroundfold-linux-x86_64
+          mkdir -p "$package"
+          cp target/x86_64-unknown-linux-musl/release/surroundfold \
+            "$package/surroundfold"
+          cp README.md "$package/"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: surroundfold-linux-x86_64
+          path: target/release/surroundfold-linux-x86_64
           if-no-files-found: error

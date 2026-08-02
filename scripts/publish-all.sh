@@ -35,9 +35,8 @@ lipo -create \
   -output "$package_root/surroundfold"
 chmod 755 "$package_root/surroundfold"
 codesign --force --sign - "$package_root/surroundfold"
-cp "$repository_root/LICENSE" "$package_root/LICENSE"
-cp "$repository_root/THIRD_PARTY_NOTICES.md" "$package_root/THIRD_PARTY_NOTICES.md"
 cp "$repository_root/README.md" "$package_root/README.md"
+cp "$repository_root/CHANGELOG.md" "$package_root/CHANGELOG.md"
 
 tar -C "$release_root" -czf "$archive" "$(basename "$package_root")"
 echo "$archive"
