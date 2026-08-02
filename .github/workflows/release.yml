@@ -141,6 +141,10 @@ jobs:
       - name: Install FFmpeg
         run: brew install ffmpeg
 
+      - name: Test native SIMD path
+        if: matrix.arch == 'x86_64'
+        run: cargo test -p surroundfold --lib --locked
+
       - name: Build release executable
         run: |
           flag_separator=$'\x1f'

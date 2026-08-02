@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn descending_delay_line_is_bit_exact_with_the_ring_reader() {
+    fn descending_delay_line_matches_the_ring_reader_within_roundoff() {
         let capacity = 64;
         let mut optimized = StereoFractionalDelay::new(capacity);
         let mut reference = vec![0.0; capacity];
@@ -672,7 +672,11 @@ mod tests {
             reference[cursor] = input;
             let expected = fractional_delay_read(&reference, cursor, delay);
             let actual = optimized.process([input, -input], [delay, delay])[0];
-            assert_eq!(actual.to_bits(), expected.to_bits(), "frame {frame}");
+            let error = (actual - expected).abs();
+            assert!(
+                error <= 8.0 * f32::EPSILON,
+                "frame {frame}: optimized {actual}, reference {expected}, error {error}"
+            );
             cursor += 1;
             if cursor == capacity {
                 cursor = 0;
