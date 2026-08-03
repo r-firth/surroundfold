@@ -215,6 +215,19 @@ pub fn build_mux_arguments(
         .filter(|(_, stream)| !matches!(stream.codec_type.as_str(), "video" | "audio"))
         .map(|(position, _)| position)
         .collect::<Vec<_>>();
+    // Read sparse streams through a second demuxer. When PGS subtitles share
+    // the media input, FFmpeg can drain that input before returning to the WAV
+    // input and physically strand consecutive FLAC packets hundreds of
+    // megabytes apart. Two synchronized readers retain a one-pass output mux;
+    // the operating-system cache normally serves the second reader.
+    let preservation_input_index = if preservation_source_positions.is_empty() {
+        0
+    } else {
+        let index = appended_tracks.len() + 1;
+        arguments.push("-i".into());
+        arguments.push(input.as_os_str().to_os_string());
+        index
+    };
     for position in &media_source_positions {
         arguments.push("-map".into());
         arguments.push(format!("0:{}", source.streams[*position].index).into());
@@ -225,7 +238,13 @@ pub fn build_mux_arguments(
     }
     for position in &preservation_source_positions {
         arguments.push("-map".into());
-        arguments.push(format!("0:{}", source.streams[*position].index).into());
+        arguments.push(
+            format!(
+                "{preservation_input_index}:{}",
+                source.streams[*position].index
+            )
+            .into(),
+        );
     }
     arguments
         .extend(["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"].map(OsString::from));
@@ -867,7 +886,7 @@ mod tests {
         assert!(
             args.arguments
                 .windows(4)
-                .any(|window| window == os_slice(["-map", "1:a:0", "-map", "0:2"]))
+                .any(|window| window == os_slice(["-map", "1:a:0", "-map", "2:2"]))
         );
         assert!(
             args.arguments

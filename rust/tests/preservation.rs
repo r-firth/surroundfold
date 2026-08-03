@@ -219,6 +219,9 @@ fn aac_compatibility_delivery_uses_the_approved_fast_encode() {
 #[test]
 #[allow(clippy::too_many_lines)] // Keep the complete sparse-PGS reproduction visible in one test.
 fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
+    const DURATION_SECONDS: u32 = 40;
+    const PGS_TIMESTAMPS: [u32; 8] = [11, 14, 17, 20, 23, 27, 31, 35];
+
     let runner = ProcessRunner::new(Cancellation::new());
     let Ok(ffmpeg) = runner.locate_required("ffmpeg", None) else {
         eprintln!("skipping PGS interleave test because ffmpeg is unavailable");
@@ -229,11 +232,18 @@ fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
         return;
     };
     let directory = tempfile::tempdir().unwrap();
-    let subtitle = directory.path().join("late.sup");
     let input = directory.path().join("source.mkv");
     let rendered = directory.path().join("render.wav");
     let output = directory.path().join("result.mkv");
-    generate_sparse_pgs(&subtitle);
+    let subtitles = PGS_TIMESTAMPS
+        .iter()
+        .enumerate()
+        .map(|(index, timestamp)| {
+            let path = directory.path().join(format!("late-{index}.sup"));
+            generate_sparse_pgs(&path, *timestamp);
+            path
+        })
+        .collect::<Vec<_>>();
 
     let mut source_arguments = [
         "-y",
@@ -242,21 +252,21 @@ fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=640x360:rate=24:duration=12",
+        "testsrc2=size=640x360:rate=24:duration=40",
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:sample_rate=48000:duration=12",
-        "-f",
-        "sup",
-        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=40",
     ]
     .map(OsString::from)
     .to_vec();
-    source_arguments.push(subtitle.as_os_str().to_os_string());
+    for subtitle in &subtitles {
+        source_arguments.extend(["-f", "sup", "-i"].map(OsString::from));
+        source_arguments.push(subtitle.as_os_str().to_os_string());
+    }
     source_arguments.extend(["-map", "0:v", "-map", "1:a"].map(OsString::from));
-    for _ in 0..16 {
-        source_arguments.extend(["-map", "2:s:0"].map(OsString::from));
+    for input_index in 2..2 + subtitles.len() {
+        source_arguments.extend(["-map".into(), format!("{input_index}:s:0").into()]);
     }
     source_arguments.extend(
         [
@@ -294,7 +304,7 @@ fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=48000:cl=stereo:d=12",
+            "anullsrc=r=48000:cl=stereo:d=40",
             "-c:a",
             "pcm_s24le",
         ],
@@ -309,7 +319,7 @@ fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
             .iter()
             .filter(|stream| stream.codec_name == "hdmv_pgs_subtitle")
             .count(),
-        16
+        PGS_TIMESTAMPS.len()
     );
     let selected_stream = source
         .streams
@@ -321,7 +331,7 @@ fn sparse_pgs_streams_do_not_starve_appended_audio_packets() {
         title: BINAURAL_TITLE,
         codec: OutputCodec::Flac,
         sample_rate: 48_000,
-        frames: 576_000,
+        frames: u64::from(DURATION_SECONDS) * 48_000,
     }];
     let arguments = build_mux_arguments(
         &input,
@@ -661,7 +671,7 @@ fn decoded_s24le(runner: &ProcessRunner, ffmpeg: &Path, input: &Path, selector: 
     result.stdout
 }
 
-fn generate_sparse_pgs(path: &Path) {
+fn generate_sparse_pgs(path: &Path, show_seconds: u32) {
     fn append_segment(bytes: &mut Vec<u8>, timestamp: u32, kind: u8, payload: &[u8]) {
         bytes.extend_from_slice(b"PG");
         bytes.extend_from_slice(&timestamp.to_be_bytes());
@@ -671,12 +681,12 @@ fn generate_sparse_pgs(path: &Path) {
         bytes.extend_from_slice(payload);
     }
 
-    const SHOW: u32 = 11 * 90_000;
-    const CLEAR: u32 = 11 * 90_000 + 45_000;
+    let show = show_seconds * 90_000;
+    let clear = show + 45_000;
     let mut bytes = Vec::new();
     append_segment(
         &mut bytes,
-        SHOW,
+        show,
         0x16,
         &[
             0x07, 0x80, 0x04, 0x38, 0x10, 0, 1, 0x80, 0, 0, 1, 0, 0, 0, 0, 0, 100, 0, 100,
@@ -684,30 +694,30 @@ fn generate_sparse_pgs(path: &Path) {
     );
     append_segment(
         &mut bytes,
-        SHOW,
+        show,
         0x17,
         &[1, 0, 0, 0, 0, 0, 0x07, 0x80, 0x04, 0x38],
     );
     append_segment(
         &mut bytes,
-        SHOW,
+        show,
         0x14,
         &[0, 0, 0, 16, 128, 128, 0, 1, 235, 128, 128, 255],
     );
     append_segment(
         &mut bytes,
-        SHOW,
+        show,
         0x15,
         &[0, 0, 0, 0xc0, 0, 0, 12, 0, 2, 0, 2, 1, 1, 0, 0, 1, 1, 0, 0],
     );
-    append_segment(&mut bytes, SHOW, 0x80, &[]);
+    append_segment(&mut bytes, show, 0x80, &[]);
     append_segment(
         &mut bytes,
-        CLEAR,
+        clear,
         0x16,
         &[0x07, 0x80, 0x04, 0x38, 0x10, 0, 2, 0, 0, 0, 0],
     );
-    append_segment(&mut bytes, CLEAR, 0x80, &[]);
+    append_segment(&mut bytes, clear, 0x80, &[]);
     fs::write(path, bytes).unwrap();
 }
 
