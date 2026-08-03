@@ -3,6 +3,12 @@
 All notable changes to SurroundFold are recorded here. Version headings and
 conventional-commit entries are maintained by Commitizen.
 
+## v0.1.1 (2026-08-03)
+
+### Fix
+
+- prevent sparse subtitles starving appended audio
+
 ## v0.1.0 (2026-08-02)
 
 ### Added
