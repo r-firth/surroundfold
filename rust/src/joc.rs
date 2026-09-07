@@ -175,6 +175,32 @@ impl JocDecoder {
         }
     }
 
+    pub(crate) fn conceal_missing(
+        &mut self,
+        previous: &JocFrame,
+        frame_samples: usize,
+    ) -> Result<JocFrame, AppError> {
+        if frame_samples == 0 || !frame_samples.is_multiple_of(QMF_SUBBANDS) {
+            return Err(invalid(format!(
+                "JOC frame has {frame_samples} PCM samples; expected a positive multiple of {QMF_SUBBANDS}"
+            )));
+        }
+        let timeslots = frame_samples / QMF_SUBBANDS;
+        if timeslots > 32 {
+            return Err(invalid(format!(
+                "JOC frame spans {timeslots} QMF timeslots; the syntax can address at most 32"
+            )));
+        }
+        let sequence = match self.last_sequence.unwrap_or(previous.sequence) {
+            1023 => 1,
+            last => last + 1,
+        };
+        self.last_sequence = Some(sequence);
+        let mut held = previous.hold_last(timeslots);
+        held.sequence = sequence;
+        Ok(held)
+    }
+
     /// Decodes and temporally interpolates one JOC EMDF payload.
     ///
     /// `frame_samples` is the number of PCM samples decoded from the matching
@@ -601,8 +627,8 @@ fn unsupported(message: impl Into<String>) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAND_COUNTS, COARSE_GENERIC, FINE_SPARSE, JocDecoder, QMF_SUBBANDS, huffman_decode,
-        subband_to_parameter_band,
+        BAND_COUNTS, COARSE_GENERIC, DownmixConfiguration, FINE_SPARSE, JocDecoder, JocFrame,
+        QMF_SUBBANDS, huffman_decode, subband_to_parameter_band,
     };
     use crate::eac3::{BitReader, MetadataPayload};
 
@@ -627,6 +653,34 @@ mod tests {
         let decoder = JocDecoder::new();
         assert!(decoder.previous.is_empty());
         assert_eq!(QMF_SUBBANDS, 64);
+    }
+
+    #[test]
+    fn missing_frame_concealment_holds_coefficients_and_advances_sequence() {
+        let channels = 5;
+        let previous = JocFrame {
+            downmix: DownmixConfiguration::FiveChannel,
+            object_count: 1,
+            input_channels: channels,
+            timeslots: 1,
+            clip_gain: 1.0,
+            sequence: 41,
+            splice: false,
+            coefficients: vec![0.25; channels * QMF_SUBBANDS],
+        };
+        let mut decoder = JocDecoder::new();
+        decoder.last_sequence = Some(previous.sequence);
+
+        let held = decoder.conceal_missing(&previous, 1536).unwrap();
+
+        assert_eq!(held.sequence, 42);
+        assert_eq!(held.timeslots, 24);
+        assert!(
+            held.coefficients()
+                .iter()
+                .all(|value| value.to_bits() == 0.25_f32.to_bits())
+        );
+        assert_eq!(decoder.last_sequence, Some(42));
     }
 
     #[test]

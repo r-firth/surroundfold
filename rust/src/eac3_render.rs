@@ -14,7 +14,7 @@ use crate::{
     isf::IsfConfig,
     joc::{DownmixConfiguration, JocDecoder, JocFrame, QMF_SUBBANDS},
     media::StreamManifest,
-    oamd::OamdDecoder,
+    oamd::{OamdDecoder, OamdFrame},
     object_render::{ObjectRenderOptions, ObjectRenderer},
     process::ProcessRunner,
     qmf::{JocReconstructor, RECONSTRUCTION_DELAY},
@@ -27,6 +27,7 @@ const FLUSH_TIMESLOTS: usize = 24;
 #[derive(Clone, Copy, Debug)]
 #[allow(clippy::struct_excessive_bools)] // Independent render switches mirror the public CLI.
 pub struct Eac3RenderOptions {
+    pub relaxed_validation: bool,
     pub gain_db: f64,
     pub surround_swap: bool,
     pub mute_bed: bool,
@@ -123,9 +124,12 @@ pub fn render_eac3_track(
         source_speakers,
         pcm: BufReader::new(decoded),
         renderer,
-        oamd: OamdDecoder::new(),
+        oamd: OamdDecoder::with_relaxed_validation(options.relaxed_validation),
         joc: JocDecoder::new(),
         reconstructor: JocReconstructor::new(),
+        relaxed_validation: options.relaxed_validation,
+        concealed_previous_frame: false,
+        last_oamd: None,
         last_joc: None,
         qmf_delay_remaining: RECONSTRUCTION_DELAY,
         lfe_queue: VecDeque::new(),
@@ -207,6 +211,9 @@ struct Eac3ObjectPipeline<'a> {
     oamd: OamdDecoder,
     joc: JocDecoder,
     reconstructor: JocReconstructor,
+    relaxed_validation: bool,
+    concealed_previous_frame: bool,
+    last_oamd: Option<OamdFrame>,
     last_joc: Option<JocFrame>,
     qmf_delay_remaining: usize,
     lfe_queue: VecDeque<f32>,
@@ -227,12 +234,8 @@ impl Eac3ObjectPipeline<'_> {
                 program.header.sample_rate, self.hrir.sample_rate
             )));
         }
-        let oamd_payload = exactly_one_payload(&program.payloads, 11, "OAMD")?;
-        let joc_payload = exactly_one_payload(&program.payloads, 14, "JOC")?;
-        let oamd = self.oamd.decode(oamd_payload)?;
-        let joc = self
-            .joc
-            .decode(joc_payload, program.header.sample_count())?;
+        let sample_count = program.header.sample_count();
+        let (mut oamd, joc) = self.decode_metadata(program)?;
         if oamd.joc_object_count != joc.object_count {
             return Err(invalid(format!(
                 "OAMD describes {} JOC essences, JOC reconstructs {}",
@@ -266,7 +269,6 @@ impl Eac3ObjectPipeline<'_> {
             ));
         }
 
-        let sample_count = program.header.sample_count();
         let pcm = read_pcm(&mut self.pcm, sample_count, self.source_channels)?;
         self.source_samples = self
             .source_samples
@@ -295,11 +297,83 @@ impl Eac3ObjectPipeline<'_> {
         if let Some(index) = lfe_index {
             self.lfe_queue.extend(planar[index].iter().copied());
         }
-        self.renderer
-            .schedule_at(program.sample_start, oamd.updates)?;
+        let updates = std::mem::take(&mut oamd.updates);
+        self.renderer.schedule_at(program.sample_start, updates)?;
         self.emit_aligned(&reconstructed)?;
+        self.last_oamd = Some(oamd);
         self.last_joc = Some(joc);
         Ok(())
+    }
+
+    fn decode_metadata(
+        &mut self,
+        program: &ProgramFrame,
+    ) -> Result<(OamdFrame, JocFrame), AppError> {
+        let oamd = self.decode_oamd(&program.payloads)?;
+        let joc_payload = optional_payload(&program.payloads, 14, "JOC")?;
+        let sample_count = program.header.sample_count();
+        match (oamd, joc_payload) {
+            (Some(oamd), Some(joc)) => {
+                self.concealed_previous_frame = false;
+                Ok((oamd, self.joc.decode(joc, sample_count)?))
+            }
+            (None, None) if self.relaxed_validation && !self.concealed_previous_frame => {
+                let mut oamd = self.last_oamd.clone().ok_or_else(|| {
+                    invalid("E-AC-3 Atmos stream starts without OAMD and JOC payloads")
+                })?;
+                oamd.updates.clear();
+                let joc = self
+                    .last_joc
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid("E-AC-3 Atmos stream starts without OAMD and JOC payloads")
+                    })?
+                    .clone();
+                self.concealed_previous_frame = true;
+                Ok((oamd, self.joc.conceal_missing(&joc, sample_count)?))
+            }
+            (None, None) if self.relaxed_validation => Err(invalid(
+                "E-AC-3 Atmos stream has consecutive frames without OAMD and JOC payloads",
+            )),
+            (None, _) => Err(invalid("E-AC-3 Atmos frame has no OAMD payload")),
+            (_, None) => Err(invalid("E-AC-3 Atmos frame has no JOC payload")),
+        }
+    }
+
+    fn decode_oamd(&mut self, payloads: &[MetadataPayload]) -> Result<Option<OamdFrame>, AppError> {
+        let matches = payloads
+            .iter()
+            .filter(|payload| payload.id == 11)
+            .collect::<Vec<_>>();
+        let Some(payload) = matches.first() else {
+            return Ok(None);
+        };
+        if matches.len() == 1 {
+            return self.oamd.decode(payload).map(Some);
+        }
+        if !self.relaxed_validation {
+            return Err(invalid("E-AC-3 Atmos frame has multiple OAMD payloads"));
+        }
+
+        let mut candidates = matches.into_iter().filter_map(|payload| {
+            let mut candidate = self.oamd.clone();
+            candidate
+                .decode(payload)
+                .ok()
+                .map(|frame| (candidate, frame))
+        });
+        let Some((selected_decoder, frame)) = candidates.next() else {
+            return Err(invalid(
+                "E-AC-3 Atmos frame has multiple OAMD payloads and none is valid",
+            ));
+        };
+        if candidates.any(|(_, alternative)| alternative != frame) {
+            return Err(invalid(
+                "E-AC-3 Atmos frame has multiple distinct valid OAMD payloads",
+            ));
+        }
+        self.oamd = selected_decoder;
+        Ok(Some(frame))
     }
 
     fn emit_aligned(&mut self, objects: &[Vec<f32>]) -> Result<(), AppError> {
@@ -377,15 +451,13 @@ impl Eac3ObjectPipeline<'_> {
     }
 }
 
-fn exactly_one_payload<'a>(
+fn optional_payload<'a>(
     payloads: &'a [MetadataPayload],
     id: u32,
     name: &str,
-) -> Result<&'a MetadataPayload, AppError> {
+) -> Result<Option<&'a MetadataPayload>, AppError> {
     let mut matches = payloads.iter().filter(|payload| payload.id == id);
-    let payload = matches
-        .next()
-        .ok_or_else(|| invalid(format!("E-AC-3 Atmos frame has no {name} payload")))?;
+    let payload = matches.next();
     if matches.next().is_some() {
         return Err(invalid(format!(
             "E-AC-3 Atmos frame has multiple {name} payloads"

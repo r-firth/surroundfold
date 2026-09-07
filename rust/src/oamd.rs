@@ -64,6 +64,7 @@ pub struct OamdFrame {
 #[derive(Clone, Debug, Default)]
 pub struct OamdDecoder {
     properties: Vec<ObjectProperties>,
+    relaxed_validation: bool,
 }
 
 impl OamdDecoder {
@@ -71,6 +72,15 @@ impl OamdDecoder {
     pub const fn new() -> Self {
         Self {
             properties: Vec::new(),
+            relaxed_validation: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_relaxed_validation(relaxed_validation: bool) -> Self {
+        Self {
+            properties: Vec::new(),
+            relaxed_validation,
         }
     }
 
@@ -197,7 +207,11 @@ impl OamdDecoder {
                 if trim.is_some() {
                     return Err(unsupported("multiple OAMD trim elements in one payload"));
                 }
-                trim = Some(read_trim_element(&mut bits, object_count)?);
+                trim = Some(read_trim_element(
+                    &mut bits,
+                    object_count,
+                    self.relaxed_validation,
+                )?);
             } else if element_id == 5 {
                 if decoded_extended_element {
                     return Err(unsupported(
@@ -617,10 +631,12 @@ impl DecodedTrim {
 fn read_trim_element(
     bits: &mut BitReader<'_>,
     object_count: usize,
+    relaxed_validation: bool,
 ) -> Result<DecodedTrim, AppError> {
     let warp_y = match bits.read_u8(2)? {
         0 => false,
         1 => true,
+        _ if relaxed_validation => false,
         reserved => return Err(unsupported(format!("reserved OAMD warp mode {reserved}"))),
     };
     let _reserved = bits.read_u8(2)?;
@@ -1122,7 +1138,8 @@ mod tests {
     fn decodes_custom_trim_and_warp_metadata() {
         // warp Y, custom global mode, configuration 0 centre trim -6 dB,
         // configurations 1..8 default, no per-object disables.
-        let trim = read_trim_element(&mut BitReader::new(&[0x48, 0x0c, 0x7f, 0x80]), 1).unwrap();
+        let trim =
+            read_trim_element(&mut BitReader::new(&[0x48, 0x0c, 0x7f, 0x80]), 1, false).unwrap();
         let object = trim.for_object(0);
         assert!(object.warp_y);
         let settings = object.settings(0);
@@ -1135,23 +1152,33 @@ mod tests {
 
     #[test]
     fn decodes_global_and_per_object_trim_modes() {
-        let default = read_trim_element(&mut BitReader::new(&[0]), 1).unwrap();
+        let default = read_trim_element(&mut BitReader::new(&[0]), 1, false).unwrap();
         assert_eq!(
             default.for_object(0).settings(0).mode,
             ObjectTrimMode::Default
         );
 
-        let disabled = read_trim_element(&mut BitReader::new(&[0x04]), 1).unwrap();
+        let disabled = read_trim_element(&mut BitReader::new(&[0x04]), 1, false).unwrap();
         assert_eq!(
             disabled.for_object(0).settings(0).mode,
             ObjectTrimMode::Disabled
         );
 
-        let object_disabled = read_trim_element(&mut BitReader::new(&[0x03]), 1).unwrap();
+        let object_disabled = read_trim_element(&mut BitReader::new(&[0x03]), 1, false).unwrap();
         assert_eq!(
             object_disabled.for_object(0).settings(0).mode,
             ObjectTrimMode::Disabled
         );
+    }
+
+    #[test]
+    fn relaxed_validation_ignores_reserved_warp_modes() {
+        let mut strict_bits = BitReader::new(&[0b1100_0000]);
+        let strict = read_trim_element(&mut strict_bits, 1, false).unwrap_err();
+        assert!(strict.to_string().contains("reserved OAMD warp mode 3"));
+
+        let relaxed = read_trim_element(&mut BitReader::new(&[0b1100_0000]), 1, true).unwrap();
+        assert!(!relaxed.for_object(0).warp_y);
     }
 
     #[test]

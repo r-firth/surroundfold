@@ -199,6 +199,7 @@ pub fn run(cli: &Cli, cancellation: &Cancellation) -> Result<(), AppError> {
                 &hrir,
                 room_correction.as_ref(),
                 Eac3RenderOptions {
+                    relaxed_validation: cli.unsafe_parsing,
                     gain_db: cli.gain_db,
                     surround_swap: cli.surround_swap.enabled(),
                     mute_bed: cli.mute_bed.enabled(),
