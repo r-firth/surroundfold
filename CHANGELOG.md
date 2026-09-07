@@ -3,6 +3,12 @@
 All notable changes to SurroundFold are recorded here. Version headings and
 conventional-commit entries are maintained by Commitizen.
 
+## v0.1.2 (2026-09-07)
+
+### Fix
+
+- recover isolated Atmos metadata faults with unsafe parsing
+
 ## v0.1.1 (2026-08-03)
 
 ### Fix
