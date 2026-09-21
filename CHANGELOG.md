@@ -3,6 +3,12 @@
 All notable changes to SurroundFold are recorded here. Version headings and
 conventional-commit entries are maintained by Commitizen.
 
+## v0.1.4 (2026-09-21)
+
+### Fix
+
+- reject false EMDF sync candidates before selecting Atmos metadata
+
 ## v0.1.3 (2026-09-21)
 
 ### Fix
