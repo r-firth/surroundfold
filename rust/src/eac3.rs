@@ -200,7 +200,8 @@ impl<R: Read> FrameReader<R> {
 /// Candidate sync words are searched at all possible bit alignments. Invalid
 /// candidates are ignored because compressed audio can contain the same 16-bit
 /// pattern by chance; the EMDF length, version, key, payload IDs, and payload
-/// bounds collectively validate a real block.
+/// bounds, protection-field lengths, and zero padding collectively validate a
+/// real block before its range can hide another candidate.
 #[must_use]
 pub fn extract_emdf_payloads(frame: &[u8]) -> Vec<MetadataPayload> {
     let bit_len = frame.len().saturating_mul(8);
@@ -262,7 +263,7 @@ fn parse_emdf_block(frame: &[u8], start: usize) -> Result<(usize, Vec<MetadataPa
     }
 
     let mut payloads = Vec::new();
-    while bits.remaining() >= 5 {
+    loop {
         let mut payload_id = bits.read_u32(5)?;
         if payload_id == 0 {
             break;
@@ -320,7 +321,28 @@ fn parse_emdf_block(frame: &[u8], start: usize) -> Result<(usize, Vec<MetadataPa
             bit_len: payload_bits,
         });
     }
+
+    validate_emdf_tail(&mut bits)?;
     Ok((end, payloads))
+}
+
+fn validate_emdf_tail(bits: &mut BitReader<'_>) -> Result<(), AppError> {
+    const PROTECTION_BITS: [usize; 4] = [0, 8, 32, 128];
+    // ETSI TS 102 366 H.2.1.4 and H.2.2.1.2: the terminator is followed
+    // by protection fields and at most seven zero bits to complete the byte.
+    // Protection values are implementation-defined; validate their bounds,
+    // not their contents. A chance sync word must not mask real metadata.
+    let primary = bits.read_usize(2)?;
+    let secondary = bits.read_usize(2)?;
+    if primary == 0 {
+        return Err(corrupt("reserved EMDF primary protection length"));
+    }
+    bits.skip(PROTECTION_BITS[primary] + PROTECTION_BITS[secondary])?;
+    let padding = bits.remaining();
+    if padding >= 8 || bits.read(padding)? != 0 {
+        return Err(corrupt("invalid EMDF container padding"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -574,6 +596,65 @@ mod tests {
     }
 
     #[test]
+    fn invalid_outer_candidate_does_not_hide_unaligned_metadata() {
+        let payload = MetadataPayload {
+            id: 14,
+            sample_offset: Some(37),
+            data: vec![0xa5],
+            bit_len: 8,
+        };
+        let inner = make_emdf(&payload);
+        let mut compressed_audio = vec![0; inner.len() + 1];
+        copy_unaligned(&inner, &mut compressed_audio, 3);
+        let mut frame = make_emdf(&MetadataPayload {
+            id: 11,
+            sample_offset: Some(0),
+            bit_len: compressed_audio.len() * 8,
+            data: compressed_audio,
+        });
+        // A chance sync word in compressed audio can claim a container that
+        // covers the real metadata, but its length disagrees with its tail.
+        frame.extend_from_slice(&[0; 8]);
+        let length = u16::try_from(frame.len() - 4).unwrap();
+        frame[2..4].copy_from_slice(&length.to_be_bytes());
+
+        assert_eq!(extract_emdf_payloads(&frame), [payload]);
+    }
+
+    #[test]
+    fn rejects_nonzero_emdf_padding() {
+        let mut frame = make_emdf(&MetadataPayload {
+            id: 11,
+            sample_offset: Some(0),
+            data: vec![0xa5],
+            bit_len: 8,
+        });
+        *frame.last_mut().unwrap() |= 1;
+        assert!(extract_emdf_payloads(&frame).is_empty());
+    }
+
+    #[test]
+    fn accepts_all_defined_protection_lengths_at_every_bit_alignment() {
+        let payload = MetadataPayload {
+            id: 11,
+            sample_offset: Some(37),
+            data: vec![0xa5],
+            bit_len: 8,
+        };
+        for primary in 1..=3 {
+            for secondary in 0..=3 {
+                let emdf = make_emdf_with_protection(&payload, primary, secondary);
+                for alignment in 0..8 {
+                    let mut frame = vec![0; emdf.len() + 1];
+                    copy_unaligned(&emdf, &mut frame, alignment);
+                    assert_eq!(extract_emdf_payloads(&frame), [payload.clone()]);
+                }
+            }
+        }
+        assert!(extract_emdf_payloads(&make_emdf_with_protection(&payload, 0, 0)).is_empty());
+    }
+
+    #[test]
     fn variable_length_integer_matches_emdf_rule() {
         // 0b00111 = chunk 3 + extension, then 0b0100 = chunk 2 + stop:
         // ((3 + 1) << 3) + 2 = 34.
@@ -604,6 +685,14 @@ mod tests {
     }
 
     fn make_emdf(payload: &MetadataPayload) -> Vec<u8> {
+        make_emdf_with_protection(payload, 1, 0)
+    }
+
+    fn make_emdf_with_protection(
+        payload: &MetadataPayload,
+        primary: usize,
+        secondary: usize,
+    ) -> Vec<u8> {
         let mut body = BitWriter::default();
         body.write(0, 2); // version
         body.write(0, 3); // key
@@ -620,6 +709,11 @@ mod tests {
             body.write(u64::from(*byte), 8);
         }
         body.write(0, 5); // end marker
+        body.write(primary as u64, 2);
+        body.write(secondary as u64, 2);
+        for _ in 0..[0, 1, 4, 16][primary] + [0, 1, 4, 16][secondary] {
+            body.write(0xa5, 8); // implementation-defined protection values
+        }
         while body.bit_len % 8 != 0 {
             body.write(0, 1);
         }
