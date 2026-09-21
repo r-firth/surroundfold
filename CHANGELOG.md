@@ -3,6 +3,12 @@
 All notable changes to SurroundFold are recorded here. Version headings and
 conventional-commit entries are maintained by Commitizen.
 
+## v0.1.3 (2026-09-21)
+
+### Fix
+
+- make approved binaural timing and geometry the defaults
+
 ## v0.1.2 (2026-09-07)
 
 ### Fix
