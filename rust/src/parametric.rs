@@ -68,11 +68,13 @@ impl ParametricHrtfModel {
                 direction_shape(left, right, &common_reference, sample_rate, fft_len)
             })
             .collect();
+        let common_delay =
+            profile_delay(measured, routes).max(crate::continuous::FRACTIONAL_DELAY_GUARD_FRAMES);
         Some(Self {
             sample_rate,
             fft_len,
             output_len,
-            common_delay: profile_delay(measured, routes),
+            common_delay,
             directions: routes.iter().map(|route| route.direction).collect(),
             direction_shapes,
         })
@@ -133,11 +135,9 @@ impl ParametricHrtfModel {
         let forward = planner.plan_fft_forward(self.fft_len);
         let inverse = planner.plan_fft_inverse(self.fft_len);
         for (route_position, route) in routes.iter().enumerate() {
-            // Preserve the approved virtual-speaker baseline. The continuous
-            // renderer uses the physically smooth 3-D interaural projection,
-            // but changing these established route filters would also change
-            // the default renderer before listening approval.
-            let lateral = baseline_horizontal_lateral_position(route.direction);
+            // Match the continuous renderer's physical 3-D lateral cues,
+            // including their reduction toward the elevation poles.
+            let lateral = interaural_axis_projection(route.direction);
             let (mut left_magnitude, mut right_magnitude) =
                 geometric_magnitude(lateral, self.sample_rate, self.fft_len);
             for bin in 0..left_magnitude.len() {
@@ -159,10 +159,13 @@ impl ParametricHrtfModel {
                 forward.as_ref(),
                 inverse.as_ref(),
             );
-            let itd = lateral * MAXIMUM_ITD_SECONDS * self.sample_rate as f32;
+            let itd = crate::continuous::woodworth_itd_seconds(lateral) * self.sample_rate as f32;
+            // The continuous path reserves one sample beyond the profile
+            // delay. Use the same origin for the route filters.
+            let common = self.common_delay as f32 + 1.0;
             filters[route.index] = (
-                delayed_impulse(&left, self.common_delay as f32 + itd.max(0.0)),
-                delayed_impulse(&right, self.common_delay as f32 + (-itd).max(0.0)),
+                delayed_impulse(&left, common + itd.max(0.0)),
+                delayed_impulse(&right, common + (-itd).max(0.0)),
             );
         }
     }
@@ -181,15 +184,6 @@ pub(crate) fn apply_direction_shaped_parametric_hrtf(
     let model = ParametricHrtfModel::new(&measured, routes, sample_rate)?;
     model.apply(filters, routes);
     Some(model)
-}
-
-fn baseline_horizontal_lateral_position(direction: [f32; 3]) -> f32 {
-    let horizontal = direction[0].hypot(direction[1]);
-    if horizontal > f32::EPSILON {
-        (direction[0] / horizontal).clamp(-1.0, 1.0)
-    } else {
-        0.0
-    }
 }
 
 fn interaural_axis_projection(direction: [f32; 3]) -> f32 {
@@ -373,18 +367,13 @@ pub(crate) fn minimum_phase_impulse(
         .collect()
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
 fn delayed_impulse(impulse: &[f32], delay: f32) -> Vec<f32> {
-    let whole = delay.floor().max(0.0) as usize;
-    let fraction = (delay - whole as f32).clamp(0.0, 1.0);
-    let mut delayed = vec![0.0; impulse.len().saturating_add(whole).saturating_add(1)];
+    let kernel = crate::continuous::fractional_delay_impulse(delay);
+    let mut delayed = vec![0.0; impulse.len() + kernel.len() - 1];
     for (index, sample) in impulse.iter().copied().enumerate() {
-        delayed[index + whole] += sample * (1.0 - fraction);
-        delayed[index + whole + 1] += sample * fraction;
+        for (tap, coefficient) in kernel.iter().copied().enumerate() {
+            delayed[index + tap] += sample * coefficient;
+        }
     }
     delayed
 }
@@ -458,5 +447,124 @@ mod tests {
                 assert_eq!(*value, 0.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod route_delay_tests {
+    use super::*;
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn route_delay_preserves_upper_band_and_phase() {
+        // A pure delay must not EQ either ear. The former two-tap interpolator
+        // loses about 5.1 dB at 15 kHz/48 kHz for a half-sample delay.
+        for delay in [32.125_f32, 32.5, 32.875] {
+            let impulse = delayed_impulse(&[1.0], delay);
+            for frequency in [1_000.0_f32, 8_000.0, 15_000.0, 18_000.0] {
+                let omega = std::f32::consts::TAU * frequency / 48_000.0;
+                let response = impulse
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| Complex32::from_polar(*x, -omega * i as f32))
+                    .sum::<Complex32>();
+                let error_db = 20.0 * response.norm().log10();
+                assert!(
+                    error_db.abs() < 0.1,
+                    "delay={delay}, frequency={frequency}, error={error_db} dB"
+                );
+                let phase_error = (response * Complex32::from_polar(1.0, omega * delay)).arg();
+                assert!(phase_error.abs() < 0.01, "phase error={phase_error}");
+            }
+        }
+    }
+
+    #[test]
+    fn route_integer_delay_is_exact_and_dc_gain_is_unity() {
+        let impulse = delayed_impulse(&[1.0, -0.25], 32.0);
+        assert!((impulse[32] - 1.0).abs() < 1e-6);
+        assert!((impulse[33] + 0.25).abs() < 1e-6);
+        for delay in [11.125, 11.5, 32.875] {
+            let impulse = delayed_impulse(&[1.0], delay);
+            assert!((impulse.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn elevated_route_uses_three_dimensional_lateral_projection() {
+        // Right/up at 60 degrees elevation has x=0.5, so the analytic
+        // high-frequency ILD is 6 dB, rather than the ground-plane 12 dB.
+        let routes = [PanningRoute {
+            index: 0,
+            speaker: None,
+            direction: [0.5, 0.0, 0.866_025_4],
+        }];
+        let mut filters = vec![(vec![1.0], vec![1.0])];
+        let model = ParametricHrtfModel::new(&filters, &routes, 48_000).unwrap();
+        model.apply(&mut filters, &routes);
+        let magnitude = |impulse: &[f32]| {
+            impulse
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    Complex32::from_polar(
+                        *x,
+                        -std::f32::consts::TAU * 8_000.0 / 48_000.0 * i as f32,
+                    )
+                })
+                .sum::<Complex32>()
+                .norm()
+        };
+        let ild = 20.0 * (magnitude(&filters[0].1) / magnitude(&filters[0].0)).log10();
+        assert!((ild - 6.0).abs() < 0.1, "elevated ILD={ild} dB");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn route_delay_matches_woodworth_at_thirty_degrees() {
+        let routes = [PanningRoute {
+            index: 0,
+            speaker: None,
+            direction: [0.5, 0.866_025_4, 0.0],
+        }];
+        let mut filters = vec![(vec![1.0], vec![1.0])];
+        let model = ParametricHrtfModel::new(&filters, &routes, 48_000).unwrap();
+        model.apply(&mut filters, &routes);
+        // Remove the independently synthesized minimum-phase body, leaving
+        // only the interaural delay. Woodworth at 30 degrees is 258.813 us.
+        let (left, right) = geometric_magnitude(0.5, 48_000, model.fft_len);
+        let mut planner = FftPlanner::new();
+        let forward = planner.plan_fft_forward(model.fft_len);
+        let inverse = planner.plan_fft_inverse(model.fft_len);
+        let left = minimum_phase_impulse(
+            &left,
+            model.fft_len,
+            model.output_len,
+            forward.as_ref(),
+            inverse.as_ref(),
+        );
+        let right = minimum_phase_impulse(
+            &right,
+            model.fft_len,
+            model.output_len,
+            forward.as_ref(),
+            inverse.as_ref(),
+        );
+        let omega = std::f32::consts::TAU * 1_000.0 / 48_000.0;
+        let response = |impulse: &[f32]| {
+            impulse
+                .iter()
+                .enumerate()
+                .map(|(i, x)| Complex32::from_polar(*x, -omega * i as f32))
+                .sum::<Complex32>()
+        };
+        let phase = ((response(&filters[0].0) / response(&left))
+            / (response(&filters[0].1) / response(&right)))
+        .arg();
+        let itd_seconds = -phase / (std::f32::consts::TAU * 1_000.0);
+        assert!(
+            (itd_seconds - 0.000_258_813).abs() < 0.000_001,
+            "ITD={itd_seconds} seconds"
+        );
     }
 }

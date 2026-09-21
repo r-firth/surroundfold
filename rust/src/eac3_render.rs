@@ -104,6 +104,7 @@ pub fn render_eac3_track(
         room_correction,
         options.gain_db,
         hrir.channels.iter().map(|channel| channel.speaker),
+        options.speaker_virtualizer,
     )?;
     let renderer = ObjectRenderer::new(
         writer,

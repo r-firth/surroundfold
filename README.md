@@ -94,7 +94,13 @@ constraints retain their metadata-defined route bearing. This prevents
 intermediate positions from mixing several already-delayed HRIRs, flattening
 height through a coplanar route array, or losing upper-spectrum energy to
 short delay interpolation. Speaker-anchored and deliberately extended objects
-retain the established route renderer.
+retain the route renderer. Its static filters use the same 24-tap bandlimited
+delay, Woodworth timing, and 3-D lateral geometry as continuous objects. LFE
+retains its calibrated gain and shares the virtualized channels' time origin,
+preventing cancellation from a relative bass delay. When ground beds bypass
+virtualization with `--speaker-virtualizer on`, LFE keeps their zero-delay path.
+These corrections are always enabled; no extra build features or command-line
+options are needed.
 
 `--distance-renderer image-source` independently replaces the fixed early
 field. It uses constant-power direct/early scaling and six first-order image

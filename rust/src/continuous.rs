@@ -305,7 +305,7 @@ impl ContinuousBinaural {
     }
 }
 
-fn woodworth_itd_seconds(lateral: f32) -> f32 {
+pub(crate) fn woodworth_itd_seconds(lateral: f32) -> f32 {
     let lateral = lateral.clamp(-1.0, 1.0);
     MAXIMUM_ITD_SECONDS * (lateral.asin() + lateral) / WOODWORTH_MAXIMUM_ANGLE_TERM
 }
@@ -543,6 +543,23 @@ fn fractional_delay_table() -> &'static [[f32; FRACTIONAL_DELAY_TAPS]] {
             .map(fractional_delay_kernel)
             .collect()
     })
+}
+
+/// Bake the moving renderer's delay kernel into a static route FIR. The
+/// caller supplies the common causal guard, so this adds no further latency.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn fractional_delay_impulse(delay: f32) -> Vec<f32> {
+    let whole = delay.floor() as usize;
+    assert!(whole >= FRACTIONAL_DELAY_PRE_SAMPLES);
+    let kernel = &fractional_delay_table()[fractional_delay_phase(delay - whole as f32)];
+    let start = whole - FRACTIONAL_DELAY_PRE_SAMPLES;
+    let mut impulse = vec![0.0; start + FRACTIONAL_DELAY_TAPS];
+    impulse[start..].copy_from_slice(kernel);
+    impulse
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]

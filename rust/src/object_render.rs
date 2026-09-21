@@ -1676,7 +1676,7 @@ mod tests {
                 .collect(),
             directional: Vec::new(),
         };
-        let writer = BinauralWriter::new(&output, &hrir, None, 0.0, speakers).unwrap();
+        let writer = BinauralWriter::new(&output, &hrir, None, 0.0, speakers, false).unwrap();
         let mut renderer = ObjectRenderer::new(
             writer,
             &hrir,
@@ -2315,7 +2315,7 @@ mod tests {
                 .collect(),
             directional: Vec::new(),
         };
-        let writer = BinauralWriter::new(output, &hrir, None, 0.0, speakers).unwrap();
+        let writer = BinauralWriter::new(output, &hrir, None, 0.0, speakers, false).unwrap();
         let mut renderer = ObjectRenderer::new(
             writer,
             &hrir,

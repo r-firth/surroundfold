@@ -259,8 +259,17 @@ impl BinauralWriter {
         room_correction: Option<&RoomCorrection>,
         gain_db: f64,
         speakers: impl IntoIterator<Item = Speaker>,
+        ground_bypass: bool,
     ) -> Result<Self, AppError> {
-        Self::new_with_parametric_hrtf(output, hrir, room_correction, gain_db, speakers, true)
+        Self::new_with_parametric_hrtf(
+            output,
+            hrir,
+            room_correction,
+            gain_db,
+            speakers,
+            true,
+            ground_bypass,
+        )
     }
 
     #[cfg(test)]
@@ -271,7 +280,15 @@ impl BinauralWriter {
         gain_db: f64,
         speakers: impl IntoIterator<Item = Speaker>,
     ) -> Result<Self, AppError> {
-        Self::new_with_parametric_hrtf(output, hrir, room_correction, gain_db, speakers, false)
+        Self::new_with_parametric_hrtf(
+            output,
+            hrir,
+            room_correction,
+            gain_db,
+            speakers,
+            false,
+            false,
+        )
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
@@ -282,6 +299,7 @@ impl BinauralWriter {
         gain_db: f64,
         speakers: impl IntoIterator<Item = Speaker>,
         parametric_hrtf: bool,
+        ground_bypass: bool,
     ) -> Result<Self, AppError> {
         let master_gain = 10_f64.powf(gain_db / 20.0) as f32;
         if !master_gain.is_finite() {
@@ -310,7 +328,7 @@ impl BinauralWriter {
             panning_routes,
             maximum_impulse,
             parametric_model,
-        } = prepare_buses(hrir, &unique_speakers, parametric_hrtf)?;
+        } = prepare_buses(hrir, &unique_speakers, parametric_hrtf, ground_bypass)?;
         let correction_tail = room_correction.map_or(0, |correction| {
             correction
                 .left
@@ -611,6 +629,7 @@ fn prepare_buses(
     hrir: &HrirSet,
     speakers: &[Speaker],
     parametric_hrtf: bool,
+    ground_bypass: bool,
 ) -> Result<PreparedBuses, AppError> {
     let capacity = speakers.len() + hrir.directional.len();
     let mut filters = Vec::with_capacity(capacity);
@@ -656,6 +675,18 @@ fn prepare_buses(
     } else {
         None
     };
+    if !ground_bypass
+        && let Some(model) = parametric_model.as_ref()
+        && let Some(index) = speakers.iter().position(|speaker| *speaker == Speaker::Lfe)
+    {
+        // LFE bypasses directional colour, but must retain the same common
+        // time origin as the virtualized mains. A zero-delay bypass against
+        // the bundled 381-frame origin can cancel correlated bass at 63 Hz.
+        let delay = model.common_delay() + 1;
+        let mut impulse = vec![0.0; delay + 1];
+        impulse[delay] = LFE_GAIN_PER_EAR;
+        filters[index] = (impulse.clone(), impulse);
+    }
     if parametric_model.is_some() {
         for (index, (left, right)) in filters.iter().enumerate() {
             let impulse_length = left.len().max(right.len());
@@ -695,6 +726,78 @@ mod tests {
         finishing::FinishingEq,
         hrir::{HrirChannel, HrirSet, Speaker},
     };
+
+    #[test]
+    fn calibrated_lfe_shares_the_front_centre_time_origin() {
+        let mut impulse = vec![0.0; 64];
+        impulse[32] = 1.0;
+        let hrir = HrirSet {
+            sample_rate: 48_000,
+            channels: vec![HrirChannel {
+                speaker: Speaker::FrontCenter,
+                left: impulse.clone(),
+                right: impulse,
+            }],
+            directional: Vec::new(),
+        };
+        let mut peak_positions = Vec::new();
+        for channel in 0..2 {
+            let mut prepared =
+                super::prepare_buses(&hrir, &[Speaker::FrontCenter, Speaker::Lfe], true, false)
+                    .unwrap();
+            let mut inputs = vec![vec![0.0; crate::dsp::DEFAULT_CONVOLUTION_BLOCK]; 2];
+            inputs[channel][0] = 1.0;
+            let mut left = vec![0.0; crate::dsp::DEFAULT_CONVOLUTION_BLOCK];
+            let mut right = left.clone();
+            prepared
+                .convolver
+                .process(&inputs, &[true; 2], &mut left, &mut right)
+                .unwrap();
+            let peak = left
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .unwrap();
+            peak_positions.push(peak.0);
+            let expected_gain = if channel == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                super::LFE_GAIN_PER_EAR
+            };
+            assert!((peak.1 - expected_gain).abs() < 1e-5);
+        }
+        assert_eq!(
+            peak_positions[0], peak_positions[1],
+            "LFE and front centre must share the common delay"
+        );
+    }
+
+    #[test]
+    fn lfe_keeps_zero_delay_when_ground_channels_bypass_virtualization() {
+        let mut impulse = vec![0.0; 64];
+        impulse[32] = 1.0;
+        let hrir = HrirSet {
+            sample_rate: 48_000,
+            channels: vec![HrirChannel {
+                speaker: Speaker::FrontCenter,
+                left: impulse.clone(),
+                right: impulse,
+            }],
+            directional: Vec::new(),
+        };
+        let mut prepared =
+            super::prepare_buses(&hrir, &[Speaker::FrontCenter, Speaker::Lfe], true, true).unwrap();
+        let mut inputs = vec![vec![0.0; crate::dsp::DEFAULT_CONVOLUTION_BLOCK]; 2];
+        inputs[1][0] = 1.0;
+        let mut left = vec![0.0; crate::dsp::DEFAULT_CONVOLUTION_BLOCK];
+        let mut right = left.clone();
+        prepared
+            .convolver
+            .process(&inputs, &[true; 2], &mut left, &mut right)
+            .unwrap();
+        assert!((left[0] - super::LFE_GAIN_PER_EAR).abs() < 1e-5);
+        assert!(left[1..].iter().all(|sample| sample.abs() < 1e-5));
+    }
 
     #[test]
     fn flushes_the_exact_impulse_tail() {

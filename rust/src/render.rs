@@ -195,6 +195,7 @@ fn render_raw(
         room_correction,
         options.gain_db,
         hrir.channels.iter().map(|channel| channel.speaker),
+        options.speaker_virtualizer,
     )?;
     let mut processor = ChannelProcessor::new(
         speakers,
